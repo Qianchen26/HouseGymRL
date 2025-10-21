@@ -353,16 +353,34 @@ def create_tasks_from_real_config(region_cfg: Dict, rng: np.random.Generator) ->
 
 
 def create_unified_ramp() -> Callable[[int], float]:
+    """
+    创建统一的容量爬坡函数。
+    
+    Warmup阶段：前warmup_days天完全没有资源（capacity=0）
+    Rise阶段：从第(warmup_days+1)天开始线性增长，在rise_days天内达到满容量
+    
+    修复了off-by-one问题：现在warmup_days=60意味着day 0到59没有资源，
+    day 60（第61天）开始有资源。
+    """
     params = config.UNIFIED_RAMP_PARAMS
 
     def ramp(day: int) -> float:
-        if day < params["warmup_days"]:
+        warmup = params["warmup_days"]
+        rise = params["rise_days"]
+        
+        # Warmup阶段：day < warmup时没有资源
+        if day < warmup:
             return 0.0
-        progress = (day - params["warmup_days"]) / params["rise_days"]
+        
+        # Rise阶段：从day=warmup开始线性增长
+        # day=warmup时，capacity = 1/rise_days（一个小的正数）
+        # day=warmup+rise_days-1时，capacity = 1.0（满容量）
+        days_since_warmup_started = day - warmup + 1
+        progress = days_since_warmup_started / rise
+        
         return float(min(params["capacity_ratio"], max(0.0, progress)))
 
     return ramp
-
 
 def make_region_env(
     region_key: str,
@@ -379,7 +397,6 @@ def make_region_env(
     return env_cls(
         tasks_df=tasks_df,
         resources=resources,
-        M=config.M_CANDIDATES,
         max_steps=config.MAX_STEPS,
         seed=seed,
         k_ramp=k_ramp,
@@ -661,14 +678,14 @@ def load_latest_model() -> Optional[SAC]:
 
 def check_model_dimensions(model: SAC) -> None:
     action_dim = int(np.prod(model.action_space.shape))
-    if action_dim != config.M_CANDIDATES:
+    if action_dim != config.MAX_HOUSES:
         raise ValueError(
-            f"Loaded model expects action dimension {action_dim}, but config.M_CANDIDATES={config.M_CANDIDATES}. "
-            "Please retrain the model or adjust config.M_CANDIDATES accordingly before evaluation."
+            f"Loaded model expects action dimension {action_dim}, but config.MAX_HOUSES={config.MAX_HOUSES}. "
+            "Please retrain the model or adjust config.MAX_HOUSES accordingly before evaluation."
         )
 
     obs_dim = int(np.prod(model.observation_space.shape))
-    expected = config.OBS_G + config.M_CANDIDATES * config.OBS_F
+    expected = config.OBS_G + config.MAX_HOUSES * config.OBS_F
     if obs_dim != expected:
         raise ValueError(
             f"Model observation dimension {obs_dim} does not match expected {expected}. "

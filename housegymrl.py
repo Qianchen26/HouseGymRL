@@ -9,10 +9,10 @@ from gymnasium import spaces
 
 from config import (
     BATCH_ARRIVAL_CONFIG,
-    M_CANDIDATES,
     MAX_STEPS,
     OBS_F,
     OBS_G,
+    MAX_HOUSES,
 )
 
 
@@ -101,7 +101,6 @@ class BaseEnv(gym.Env):
         resources: Optional[Dict] = None,
         scenario_sampler: Optional[Callable[[], Tuple[pd.DataFrame, Dict, Dict]]] = None,
         *,
-        M: int = M_CANDIDATES,
         max_steps: int = MAX_STEPS,
         seed: Optional[int] = None,
         batch_arrival: bool = True,
@@ -110,7 +109,7 @@ class BaseEnv(gym.Env):
         candidate_policy: str = "random",
     ) -> None:
         super().__init__()
-        self.M = int(M)
+        # M 和 candidate_policy 参数保留用于兼容性，但在全观察架构下不再使用
         self.max_steps = int(max_steps)
         self.scenario_sampler = scenario_sampler
         self.seed = int(seed) if seed is not None else 0
@@ -162,12 +161,21 @@ class BaseEnv(gym.Env):
 
         self._load_scenario(tasks_df, resources)
 
-        obs_dim = OBS_G + self.M * OBS_F
+        # 全观察架构：固定维度空间声明（适配所有 region）
+        # Observation: [OBS_G 全局特征] + [MAX_HOUSES * OBS_F 房屋特征]
+        #   - 全局特征(6维): day, workers, backlog, remain_share, lvl1_share, lvl2_share
+        #   - 房屋特征(5维/户): remain, delay, dmg, cmax, mask
+        #   - 通过 mask 区分真实房屋(1.0) vs padding(0.0)
+        obs_dim = OBS_G + MAX_HOUSES * OBS_F
         self.observation_space = spaces.Box(
             low=-1e6, high=1e6, shape=(obs_dim,), dtype=np.float32
         )
+
+        # Action: 为每个房屋位置输出 [0,1] 分数
+        #   - 分数将通过 allocate_workers 转换为整数人力分配
+        #   - padding 位置的分数会被 mask 过滤
         self.action_space = spaces.Box(
-            low=0.0, high=1.0, shape=(self.M,), dtype=np.float32
+            low=0.0, high=1.0, shape=(MAX_HOUSES,), dtype=np.float32
         )
 
     # ------------------------------------------------------------------ #
@@ -275,27 +283,29 @@ class BaseEnv(gym.Env):
     def _sanitize_candidate_allocation(
         self, allocation: np.ndarray, cand_snapshot: Dict[str, np.ndarray], K_eff: int
     ) -> np.ndarray:
-        alloc = np.zeros(self.M, dtype=np.int32)
+        # 全观察架构：基于全状态验证分配
+        alloc = np.zeros(MAX_HOUSES, dtype=np.int32)
         flat = np.asarray(allocation, dtype=np.int32).reshape(-1)
-        take = min(flat.size, self.M)
+        take = min(flat.size, MAX_HOUSES)
         alloc[:take] = flat[:take]
 
-        idx = cand_snapshot["idx"]
-        mask = cand_snapshot["mask"] > 0.5
-        valid = idx >= 0
-        active = mask & valid
+        # 构造全状态的约束
+        N = len(self._arr_rem)
+        cmax_full = np.zeros(MAX_HOUSES, dtype=np.int32)
+        remain_full = np.zeros(MAX_HOUSES, dtype=np.int32)
+        if N > 0:
+            n = min(N, MAX_HOUSES)
+            cmax_full[:n] = self._arr_cmax[:n].astype(np.int32)
+            remain_full[:n] = self._arr_rem[:n].astype(np.int32)
 
-        alloc = np.where(active, alloc, 0)
+        # 只保留有剩余工作的房屋的分配
+        alloc = np.where(remain_full > 0, alloc, 0)
 
-        cmax = cand_snapshot["cmax"].astype(np.int32, copy=False)
-        alloc = np.minimum(alloc, cmax)
+        # 限制到 cmax 和剩余容量
+        alloc = np.minimum(alloc, cmax_full)
+        alloc = np.minimum(alloc, remain_full)
 
-        remain_cap = np.zeros(self.M, dtype=np.int32)
-        valid_idx = idx[active]
-        if valid_idx.size > 0:
-            remain_cap[active] = self._arr_rem[valid_idx].astype(np.int32, copy=False)
-        alloc = np.minimum(alloc, remain_cap)
-
+        # 如果总分配超过可用人力，按比例削减
         total = int(alloc.sum())
         if total > K_eff:
             over = total - K_eff
@@ -314,53 +324,28 @@ class BaseEnv(gym.Env):
     def _apply_candidate_allocation(
         self, allocation: np.ndarray, cand_snapshot: Dict[str, np.ndarray]
     ) -> int:
+        # 全观察架构：分配数组直接对应房屋索引
         used = 0
-        idx = cand_snapshot["idx"]
-        for pos, row in enumerate(idx):
-            give = int(allocation[pos])
-            if give <= 0 or row < 0:
+        N = len(self._arr_rem)
+        n = min(N, MAX_HOUSES, len(allocation))
+
+        for house_id in range(n):
+            give = int(allocation[house_id])
+            if give <= 0:
                 continue
-            actual = min(give, int(self._arr_rem[row]))
+            actual = min(give, int(self._arr_rem[house_id]))
             if actual <= 0:
                 continue
-            self._arr_rem[row] -= actual
+            self._arr_rem[house_id] -= actual
             used += actual
         return used
 
     def _allocate_stage_two(
         self, remaining_capacity: int, cand_snapshot: Dict[str, np.ndarray]
     ) -> int:
-        if not self.fill_non_candidates or remaining_capacity <= 0:
-            return 0
-
-        extra_mask = self._eligible_mask.copy()
-        in_cand = cand_snapshot["idx"]
-        valid_in_cand = in_cand[in_cand >= 0]
-        if valid_in_cand.size > 0:
-            extra_mask[valid_in_cand] = False
-
-        extra_idx = np.nonzero(extra_mask)[0]
-        if extra_idx.size == 0:
-            return 0
-
-        rem = self._arr_rem[extra_idx]
-        order = np.argsort(rem, kind="stable")
-
-        used = 0
-        for idx in extra_idx[order]:
-            if remaining_capacity <= 0:
-                break
-            give = min(
-                remaining_capacity,
-                int(self._arr_cmax[idx]),
-                int(self._arr_rem[idx]),
-            )
-            if give <= 0:
-                continue
-            self._arr_rem[idx] -= give
-            remaining_capacity -= give
-            used += give
-        return used
+        # 全观察架构：stage 1 已经为所有房屋分配，stage 2 不再需要
+        # 保留此函数是为了向后兼容，但直接返回0
+        return 0
 
     def _compute_completion(self) -> Tuple[float, float]:
         total_work = self._total_work_scalar
@@ -418,74 +403,25 @@ class BaseEnv(gym.Env):
         self.writer.add_scalar("env/idle_workers", info["idle_workers"], self._global_step)
 
     def _refresh_candidates(self) -> None:
-        M = self.M
-        eligible_mask = self._arrived_mask & (self._arr_rem > 0)
-        eligible = np.nonzero(eligible_mask)[0]
-
-        if eligible.size == 0:
-            idx = np.full(M, -1, dtype=np.int32)
-            self._emit_candidates(idx)
-            return
-
-        if eligible.size <= M:
-            idx = np.full(M, -1, dtype=np.int32)
-            idx[: eligible.size] = eligible
-            self._emit_candidates(idx)
-            return
-
-        policy = self.candidate_policy
-        if policy == "queue_ljf":
-            major = eligible[self._arr_dmg[eligible] == 2]
-            if major.size > 0:
-                major = major[np.argsort(-self._arr_rem[major], kind="mergesort")]
-            others = eligible[self._arr_dmg[eligible] != 2]
-            if others.size > 0:
-                others = self.rng.permutation(others)
-            order = np.concatenate([major, others])
-        elif policy == "queue_sjf":
-            minor = eligible[self._arr_dmg[eligible] == 0]
-            if minor.size > 0:
-                minor = minor[np.argsort(self._arr_rem[minor], kind="mergesort")]
-            others = eligible[self._arr_dmg[eligible] != 0]
-            if others.size > 0:
-                others = self.rng.permutation(others)
-            order = np.concatenate([minor, others])
-        elif policy == "backlog":
-            order = eligible[np.argsort(-self._arr_rem[eligible], kind="mergesort")]
-        else:  # "random"
-            order = self.rng.permutation(eligible)
-
-        order = order[:M]
-        if order.size < M:
-            idx = np.full(M, -1, dtype=np.int32)
-            idx[: order.size] = order
-        else:
-            idx = order.astype(np.int32, copy=False)
-
+        # 全观察架构：导出全量视图（所有房屋）
+        idx = np.arange(len(self._arr_rem), dtype=np.int32)
         self._emit_candidates(idx)
 
     def _emit_candidates(self, idx: np.ndarray) -> None:
-        M = self.M
-        if idx.shape[0] != M:
-            raise ValueError(f"Candidate idx length {idx.shape[0]} does not match M={M}.")
+        # 全观察架构：接收任意长度索引，返回完整字段
+        N = len(idx)
+        if N > 0:
+            remain = self._arr_rem[idx].astype(np.float32, copy=False)
+            delay = self._arr_delay[idx].astype(np.float32, copy=False)
+            dmg = self._arr_dmg[idx].astype(np.float32, copy=False)
+            cmax = self._arr_cmax[idx].astype(np.float32, copy=False)
+        else:
+            remain = delay = dmg = cmax = np.zeros(0, dtype=np.float32)
 
-        remain = np.zeros(M, dtype=np.float32)
-        delay = np.zeros(M, dtype=np.float32)
-        dmg = np.zeros(M, dtype=np.float32)
-        cmax = np.zeros(M, dtype=np.float32)
-
-        valid_rows = idx >= 0
-        if valid_rows.any():
-            sel = idx[valid_rows]
-            remain[valid_rows] = self._arr_rem[sel].astype(np.float32, copy=False)
-            delay[valid_rows] = self._arr_delay[sel].astype(np.float32, copy=False)
-            dmg[valid_rows] = self._arr_dmg[sel].astype(np.float32, copy=False)
-            cmax[valid_rows] = self._arr_cmax[sel].astype(np.float32, copy=False)
-
-        mask = ((remain > 0) & valid_rows).astype(np.float32, copy=False)
+        mask = (remain > 0).astype(np.float32, copy=False)
 
         self._last_candidates = {
-            "idx": idx.astype(np.int32, copy=False),
+            "idx": idx,
             "remain": remain,
             "delay": delay,
             "dmg": dmg,
@@ -494,6 +430,7 @@ class BaseEnv(gym.Env):
         }
 
     def _get_obs(self) -> np.ndarray:
+        # ---------- 全局特征 ----------
         total_work = self._total_work_scalar
         remain_sum = float(self._arr_rem.sum())
         backlog_cnt = int(np.sum(self._arr_rem > 0))
@@ -512,44 +449,76 @@ class BaseEnv(gym.Env):
             dtype=np.float32,
         )
 
-        cand = self._last_candidates
-        assert cand is not None, "Candidates not initialized. Call reset() first."
-        stacked = np.stack(
-            [cand["remain"], cand["delay"], cand["dmg"], cand["cmax"]], axis=1
-        ).astype(np.float32, copy=False)
-        return np.concatenate([g, stacked.reshape(-1)], axis=0).astype(np.float32, copy=False)
+        # ---------- 房屋特征矩阵（全观察架构）----------
+        N = len(self._arr_rem)
+        H = np.zeros((MAX_HOUSES, OBS_F), dtype=np.float32)
+        if N > 0:
+            n = min(N, MAX_HOUSES)
+            H[:n, 0] = self._arr_rem[:n].astype(np.float32)
+            H[:n, 1] = self._arr_delay[:n].astype(np.float32)
+            H[:n, 2] = self._arr_dmg[:n].astype(np.float32)
+            H[:n, 3] = self._arr_cmax[:n].astype(np.float32)
+            H[:n, 4] = 1.0  # mask: 1=真实房屋, 0=padding
+
+        # ---------- 拼接 ----------
+        obs = np.concatenate([g, H.reshape(-1)], axis=0).astype(np.float32)
+        return obs
 
     # ------------------------------------------------------------------ #
     # Public API
     # ------------------------------------------------------------------ #
     def step(self, action):
+        """
+        处理 MAX_HOUSES 维动作并执行环境步进。
+
+        全观察架构支持两种动作类型：
+        1. 整数分配（Baseline）：直接指定每户人力数，如 [2, 0, 5, ...]
+        2. 分数倾向（RL）：输出 [0,1] 分数，通过 allocate_workers 转换为整数分配
+
+        维度自适应：自动 pad/截断到 MAX_HOUSES，确保鲁棒性
+        Mask 机制：padding 位置的分数自动过滤，只为真实房屋分配人力
+        """
         if action is None:
             raise ValueError("Action must not be None.")
 
+        # 维度统一：pad 或截断到 MAX_HOUSES
         arr = np.asarray(action, dtype=np.float32).reshape(-1)
         if arr.size == 0:
-            arr = np.zeros(self.M, dtype=np.float32)
-        if arr.size < self.M:
-            padded = np.zeros(self.M, dtype=np.float32)
+            arr = np.zeros(MAX_HOUSES, dtype=np.float32)
+        elif arr.size < MAX_HOUSES:
+            padded = np.zeros(MAX_HOUSES, dtype=np.float32)
             padded[: arr.size] = arr
             arr = padded
-        elif arr.size > self.M:
-            arr = arr[: self.M]
+        elif arr.size > MAX_HOUSES:
+            arr = arr[: MAX_HOUSES]
 
         if not np.all(np.isfinite(arr)):
             raise ValueError("Environment received non-finite action values.")
 
+        # 兼容性检查：确保候选池已刷新（用于 _step_with_allocation）
         cand = self._last_candidates
         assert cand is not None, "Call reset() before stepping the environment."
 
+        # 路径1：整数分配（Baseline 直接指定每户人力）
         is_int_alloc = np.all(arr >= 0.0) and np.allclose(arr, np.round(arr))
         if is_int_alloc:
             allocation = np.round(arr).astype(np.int32, copy=False)
             return self._step_with_allocation(allocation)
 
+        # 路径2：分数分配（RL 输出优先级分数 → allocate_workers 转换）
         scores = np.clip(arr.astype(np.float32, copy=False), 0.0, 1.0)
         K_eff = self._effective_capacity()
-        allocation, _ = allocate_workers(scores, K_eff, cand["cmax"], cand["mask"])
+
+        # 全观察架构：直接从全状态构造 MAX_HOUSES 维度的 cmax 和 mask
+        N = len(self._arr_rem)
+        cmax_full = np.zeros(MAX_HOUSES, dtype=np.float32)
+        mask_full = np.zeros(MAX_HOUSES, dtype=np.float32)
+        if N > 0:
+            n = min(N, MAX_HOUSES)
+            cmax_full[:n] = self._arr_cmax[:n].astype(np.float32)
+            mask_full[:n] = 1.0  # mask: 真实房屋=1.0, padding=0.0
+
+        allocation, _ = allocate_workers(scores, K_eff, cmax_full, mask_full)
         return self._step_with_allocation(allocation, K_override=K_eff)
 
     def _step_with_allocation(
@@ -648,7 +617,7 @@ class BaselineEnv(BaseEnv):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        high = np.full(self.M, self.K, dtype=np.float32)
+        high = np.full(MAX_HOUSES, self.K, dtype=np.float32)
         self.action_space = spaces.Box(low=0.0, high=high, dtype=np.float32)
 
     def step(self, action: np.ndarray):
