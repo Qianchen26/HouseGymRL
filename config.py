@@ -20,12 +20,11 @@ BATCH_ARRIVAL_CONFIG = {"days": [0, 7, 14], "ratios": [0.30, 0.40, 0.30]}
 UNIFIED_RAMP_PARAMS = {"warmup_days": 60, "rise_days": 120, "capacity_ratio": 1.0}
 
 # Environment sizing constants
-MAX_HOUSES = 80000   # 所有 region 的统一 padding 上限
+M_CANDIDATES = 96
 MAX_STEPS = 1500
-
-OBS_G = 6            # 全局特征数量：day, workers, backlog, remain_share, lvl1_share, lvl2_share
-OBS_F = 5            # 每户特征：remain, delay, dmg, cmax, mask（新增 mask）
-EXPECTED_OBS_DIM = OBS_G + MAX_HOUSES * OBS_F
+OBS_G = 6
+OBS_F = 4
+EXPECTED_OBS_DIM = OBS_G + M_CANDIDATES * OBS_F
 
 # Region configuration (counts follow v5 reference; seeds default to 42)
 REGION_CONFIG = {
@@ -38,13 +37,13 @@ REGION_CONFIG = {
     "Sumbawa": {"damage_dist": [9652, 2756, 1374], "num_contractors": 10360, "seed": 48},
 }
 
-# Output directory (基础目录，不包含时间戳)
+# Output directory (Ã¥Å¸ÂºÃ§Â¡â‚¬Ã§â€ºÂ®Ã¥Â½â€¢Ã¯Â¼Å’Ã¤Â¸ÂÃ¥Å’â€¦Ã¥ÂÂ«Ã¦â€”Â¶Ã©â€”Â´Ã¦Ë†Â³)
 OUTPUT_BASE_DIR = Path("output")
-OUTPUT_DIR = OUTPUT_BASE_DIR / "default"  # 默认目录
+OUTPUT_DIR = OUTPUT_BASE_DIR / "default"  # Ã©Â»ËœÃ¨Â®Â¤Ã§â€ºÂ®Ã¥Â½â€¢
 FIG_DIR = OUTPUT_DIR / "fig"
 TAB_DIR = OUTPUT_DIR / "tab"
 
-# 确保基础目录存在
+# Ã§Â¡Â®Ã¤Â¿ÂÃ¥Å¸ÂºÃ§Â¡â‚¬Ã§â€ºÂ®Ã¥Â½â€¢Ã¥Â­ËœÃ¥Å“Â¨
 OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Evaluation constants
@@ -55,5 +54,3 @@ MAKESPAN_THRESHOLD = 1.0
 # Data location
 DATA_DIR = Path("data")
 OBSERVED_DATA_PATH = DATA_DIR / "lombok_data.pkl"
-
-
