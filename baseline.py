@@ -24,7 +24,8 @@ from pathlib import Path
 
 # Import our environment classes
 from housegymrl import BaselineEnv, OracleEnv, HousegymRLENV
-from config import REGION_CONFIG, CROSS_AVAILABILITY_SCENARIOS
+import config
+from config import CROSS_AVAILABILITY_SCENARIOS
 
 
 # ============================================================================
@@ -247,7 +248,7 @@ def test_baseline_robustness(
         DataFrame with robustness test results
     """
     results = []
-    max_contractors = REGION_CONFIG[region_key]["num_contractors"]
+    max_contractors = config.REGION_CONFIG[region_key]["num_contractors"]
 
     for availability in availability_levels:
         num_contractors = int(max_contractors * availability)

@@ -30,11 +30,11 @@ from pathlib import Path
 import pickle
 
 # Import configuration
+import config
 from config import (
     M_CANDIDATES,
     MAX_STEPS,
     COMBINED_ARRIVAL_CAPACITY_CONFIG,
-    REGION_CONFIG,
     WORK_PARAMS,
     CMAX_BY_LEVEL,
     DATA_DIR
@@ -111,22 +111,30 @@ class TrueBatchArrival:
     def step_to_day(self, day: int) -> List[int]:
         """
         Advance to given day and return newly revealed houses.
-
-        Args:
-            day: Current simulation day
-
-        Returns:
-            List of house IDs that became visible today
+        
+        Debug: Track revealed_ids updates
         """
         new_arrivals = []
 
         # Check all scheduled days up to current day
         for scheduled_day, houses in self.schedule.items():
             if scheduled_day <= day and scheduled_day > self.current_day:
+                # Debug: print what's happening
+                if len(houses) > 0:
+                    print(f"    [DEBUG] Day {day}: Batch at day {scheduled_day} releasing {len(houses)} houses")
+                    print(f"            Before: revealed_ids has {len(self.revealed_ids)} houses")
+                
                 new_arrivals.extend(houses)
                 self.revealed_ids.update(houses)
+                
+                if len(houses) > 0:
+                    print(f"            After:  revealed_ids has {len(self.revealed_ids)} houses")
 
         self.current_day = day
+        
+        if len(new_arrivals) > 0:
+            print(f"    [DEBUG] Day {day}: Total new arrivals = {len(new_arrivals)}, revealed_ids total = {len(self.revealed_ids)}")
+        
         return new_arrivals
 
     def is_complete(self) -> bool:
@@ -146,7 +154,7 @@ class StaticArrival:
 
     def __init__(self, tasks_df: pd.DataFrame):
         self.revealed_ids = set(tasks_df.index.tolist())
-        self.current_day = 0
+        self.current_day = -1  # Must be -1 so first step_to_day(0) triggers
 
     def step_to_day(self, day: int) -> List[int]:
         if day == 0 and self.current_day < 0:
@@ -268,8 +276,15 @@ class BaseEnv(gym.Env):
         self,
         region_key: str,
         num_contractors: Optional[int] = None,
+        M_ratio: float = 0.10,
+        M_min: int = 512,
+        M_max: int = 2048,
         use_batch_arrival: bool = True,
         use_capacity_ramp: bool = True,
+        stochastic_duration: bool = True,
+        observation_noise: float = 0.15,
+        capacity_noise: float = 0.10,
+        use_longterm_reward: bool = True,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
     ):
@@ -279,8 +294,15 @@ class BaseEnv(gym.Env):
         Args:
             region_key: Region name from REGION_CONFIG
             num_contractors: Number of contractors (if None, use region default)
+            M_ratio: Proportion of queue to sample as candidates (default: 0.10 = 10%)
+            M_min: Minimum number of candidates (default: 512)
+            M_max: Maximum number of candidates (default: 2048)
             use_batch_arrival: Whether to use batch arrival system
             use_capacity_ramp: Whether to use capacity ramp system
+            stochastic_duration: Whether work progress is stochastic (default: True)
+            observation_noise: Std dev of observation noise as fraction of true value (default: 0.15)
+            capacity_noise: Range of capacity reduction (default: 0.10 = 90%-100% of base)
+            use_longterm_reward: Whether to use long-term reward function (default: True)
             seed: Random seed
             max_steps: Maximum simulation days
         """
@@ -291,20 +313,28 @@ class BaseEnv(gym.Env):
         self.seed = seed
 
         # Load region configuration
-        if region_key not in REGION_CONFIG:
+        if region_key not in config.REGION_CONFIG:
             raise ValueError(f"Unknown region: {region_key}")
 
         self.region_key = region_key
-        self.region_config = REGION_CONFIG[region_key]
+        self.region_config = config.REGION_CONFIG[region_key]
 
         # Set number of contractors
         if num_contractors is None:
             num_contractors = self.region_config["num_contractors"]
         self.num_contractors = num_contractors
 
-        # Set M and max_steps
-        self.M = M_CANDIDATES
+        # Set adaptive M parameters
+        self.M_ratio = M_ratio
+        self.M_min = M_min
+        self.M_max = M_max
         self.max_steps = max_steps
+
+        # Set stochasticity parameters
+        self.stochastic_duration = stochastic_duration
+        self.obs_noise = observation_noise
+        self.capacity_noise = capacity_noise
+        self.use_longterm_reward = use_longterm_reward
 
         # Load scenario data
         self.tasks_df = self._load_scenario(region_key)
@@ -339,6 +369,12 @@ class BaseEnv(gym.Env):
         # State variables
         self.day = 0
         self.last_completion = 0.0
+
+        # Long-term reward tracking variables
+        self.waiting_time = np.zeros(len(self.tasks_df), dtype=np.int32)
+        self.last_queue_size = 0
+        self.last_workers_used = 0
+        self.last_workers_available = 0
 
         # Define spaces
         self._define_spaces()
@@ -391,10 +427,29 @@ class BaseEnv(gym.Env):
 
         return pd.DataFrame(tasks).set_index('house_id')
 
+    def _get_M(self, queue_size: int) -> int:
+        """
+        Calculate adaptive M based on current queue size.
+
+        M = ratio × queue_size, clamped to [M_min, M_max].
+
+        Args:
+            queue_size: Current number of houses in queue
+
+        Returns:
+            Number of candidates to sample
+        """
+        M = int(queue_size * self.M_ratio)
+        return max(self.M_min, min(self.M_max, M))
+
     def _define_spaces(self):
-        """Define observation and action spaces."""
-        # Observation: 6 global features + M*4 candidate features
-        obs_dim = 6 + self.M * 4
+        """
+        Define observation and action spaces.
+
+        Uses M_max to ensure fixed space dimensions across episodes.
+        """
+        # Observation: 6 global features + M_max*4 candidate features
+        obs_dim = 6 + self.M_max * 4
         self.observation_space = spaces.Box(
             low=0.0,
             high=np.inf,
@@ -402,45 +457,188 @@ class BaseEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Action: M continuous scores [0,1]
+        # Action: M_max continuous scores [0,1]
         self.action_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.M,),
+            shape=(self.M_max,),
             dtype=np.float32
         )
 
     def _effective_capacity(self) -> int:
-        """Get current effective capacity based on ramp."""
-        return self.capacity_system.get_capacity(self.day)
+        """
+        Get current effective capacity with stochastic variation.
+
+        Returns base capacity from ramp system, with random noise applied
+        if capacity_noise > 0.
+
+        Returns:
+            Number of available contractors (with noise if enabled)
+        """
+        base_capacity = self.capacity_system.get_capacity(self.day)
+
+        if self.capacity_noise > 0 and base_capacity > 0:
+            # Add random variation: (1 - noise) to 1.0 of base
+            # e.g., noise=0.10 → 90% to 100% of base capacity
+            noise_factor = self.rng.uniform(1.0 - self.capacity_noise, 1.0)
+            actual_capacity = int(base_capacity * noise_factor)
+            return max(0, actual_capacity)
+
+        return base_capacity
+
+    @property
+    def decision_day(self) -> int:
+        """
+        Get the day value used for current/last decisions.
+
+        During step N, decisions are made using day N-1.
+        This property returns the day that was actually used for decision-making.
+        """
+        # During a step, self.day hasn't been incremented yet, so it IS the decision day
+        # After a step completes, self.day has been incremented, so decision_day = day - 1
+        # This is mainly useful after step() completes
+        return max(0, self.day - 1) if self.day > 0 else 0
+
+    @property
+    def completed_days(self) -> int:
+        """
+        Get the number of fully completed days.
+
+        After step N, this returns N (days 0 through N-1 have been completed).
+        """
+        return self.day
+
+    def get_candidate_seed_for_step(self, step_num: int) -> int:
+        """
+        Get the seed that was/will be used for candidate selection in step N.
+
+        Args:
+            step_num: The step number (1-indexed)
+
+        Returns:
+            The seed value used for candidate selection
+
+        Example:
+            After 50 steps, to reproduce the candidates from step 50:
+            seed = env.get_candidate_seed_for_step(50)  # Returns seed for day 49
+        """
+        # Step N uses day N-1 for decisions
+        decision_day = max(0, step_num - 1)
+        return (self.seed if self.seed is not None else 42) + decision_day * 1000
+
+    def _apply_work(self, allocation: Dict[int, int]):
+        """
+        Apply work allocation with stochastic progress.
+
+        If stochastic_duration is enabled, work progress has random variation
+        around the expected value (σ = 20% of expected progress).
+
+        Args:
+            allocation: Dictionary mapping house_id to number of workers
+        """
+        for house_id, workers in allocation.items():
+            if self.stochastic_duration:
+                # Expected progress = number of workers allocated
+                expected_progress = workers
+
+                # Actual progress with noise (σ = 20% of expected)
+                # This models variability in worker efficiency, weather, materials, etc.
+                actual_progress = self.rng.normal(
+                    expected_progress,
+                    expected_progress * 0.20
+                )
+                actual_progress = max(0, actual_progress)
+            else:
+                # Deterministic progress (legacy mode)
+                actual_progress = workers
+
+            # Update remaining work
+            self._arr_rem[house_id] -= actual_progress
+            self._arr_rem[house_id] = max(0, self._arr_rem[house_id])
+
+    def _calculate_reward(self, completed: List[int]) -> float:
+        """
+        Calculate long-term reward with multiple components.
+
+        Components:
+        1. Completion reward: Houses completed (no damage weighting)
+        2. Queue reduction bonus: Encourages clearing the queue
+        3. Urgency penalty: Punishes long waiting times
+        4. Worker efficiency bonus: Encourages efficient resource use
+
+        Args:
+            completed: List of house IDs completed this step
+
+        Returns:
+            Combined reward value
+        """
+        if not self.use_longterm_reward:
+            # Simple immediate reward (legacy mode)
+            revealed_ids = list(self.arrival_system.revealed_ids)
+            if len(revealed_ids) > 0:
+                return len(completed) / len(revealed_ids)
+            return 0.0
+
+        # Component 1: Immediate completion (NO damage weighting per user request)
+        completion_reward = 0.0
+        revealed_ids = list(self.arrival_system.revealed_ids)
+        if len(revealed_ids) > 0:
+            completion_reward = len(completed) / len(revealed_ids)
+
+        # Component 2: Queue reduction bonus
+        current_queue = self.waiting_queue.size()
+        if self.last_queue_size > 0:
+            queue_reduction = (self.last_queue_size - current_queue) / self.last_queue_size
+            queue_bonus = max(0, queue_reduction) * 0.1
+        else:
+            queue_bonus = 0.0
+
+        # Component 3: Urgency penalty (punish long waits)
+        urgency_penalty = 0.0
+        for house_id in self.waiting_queue.get_all():
+            if self.waiting_time[house_id] > 50:  # Houses waiting > 50 days
+                urgency_penalty -= (self.waiting_time[house_id] - 50) / 10000
+
+        # Component 4: Worker efficiency bonus
+        if self.last_workers_available > 0:
+            efficiency = self.last_workers_used / self.last_workers_available
+            efficiency_bonus = efficiency * 0.03
+        else:
+            efficiency_bonus = 0.0
+
+        # Combine components with weights
+        total_reward = (
+            completion_reward * 1.0 +      # Main signal: complete houses
+            queue_bonus * 0.2 +             # Secondary: reduce queue
+            urgency_penalty * 0.1 +         # Penalty: avoid long waits
+            efficiency_bonus * 0.05         # Bonus: use workers efficiently
+        )
+
+        return total_reward
 
     def _select_candidates(self, queue_ids: List[int]) -> List[int]:
         """
-        PURE RANDOM candidate selection with DETERMINISTIC seeding.
+        Adaptive random candidate selection.
 
-        This is the key innovation: No artificial bias.
-        RL must learn from natural random samples.
-
-        CRITICAL: Uses day-based seed to ensure all methods see
-        the same candidates on the same day (Information Parity).
+        Samples M candidates where M = ratio × queue_size, clamped to [M_min, M_max].
+        Uses instance RNG for true stochasticity across different runs.
 
         Args:
             queue_ids: All houses in queue
 
         Returns:
-            Randomly selected M candidates (deterministic for given day)
+            Randomly selected M candidates
         """
-        if len(queue_ids) <= self.M:
+        # Calculate adaptive M
+        M = self._get_M(len(queue_ids))
+
+        if len(queue_ids) <= M:
             return queue_ids
 
-        # CRITICAL: Use day-based seed for candidate selection
-        # This ensures all methods see the same candidates on the same day
-        # regardless of their internal RNG state
-        selection_seed = (self.seed if self.seed is not None else 42) + self.day * 1000
-        selection_rng = np.random.default_rng(selection_seed)
-
-        # Pure random selection - no bias, no pre-filtering
-        selected = selection_rng.choice(queue_ids, size=self.M, replace=False)
+        # Use instance RNG for stochastic selection
+        # This allows different policies to see different candidate sequences,
+        # creating a truly stochastic environment for RL to learn from
+        selected = self.rng.choice(queue_ids, size=M, replace=False)
         return selected.tolist()
 
     def step(self, action):
@@ -470,10 +668,13 @@ class BaseEnv(gym.Env):
             terminated = False
             truncated = self.day >= self.max_steps
             info = {
-                "day": self.day,
+                "day": self.day,  # Keep for backward compatibility
+                "completed_days": self.day,
+                "decision_day": self.day - 1 if self.day > 0 else 0,
                 "K": 0,
                 "queue_size": self.waiting_queue.size(),
                 "completion": self.last_completion,
+                "M": self._get_M(self.waiting_queue.size()),  # Actual M this step
             }
             return obs, reward, terminated, truncated, info
 
@@ -521,10 +722,25 @@ class BaseEnv(gym.Env):
         Returns:
             Standard gym step outputs
         """
-        # Apply work
-        for house_id, workers in allocation.items():
-            self._arr_rem[house_id] -= workers
-            self._arr_rem[house_id] = max(0, self._arr_rem[house_id])
+        # ===== 新增：Debug allocation =====
+        if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
+            print(f"    [ALLOCATION DEBUG] Day {self.day}:")
+            print(f"      Allocation dict size: {len(allocation)}")
+            if len(allocation) > 0:
+                total_workers = sum(allocation.values())
+                print(f"      Total workers allocated: {total_workers}")
+                print(f"      Sample allocations: {list(allocation.items())[:3]}")
+            else:
+                print(f"      ⚠️  Allocation is EMPTY!")
+        # ==================================
+
+        # Update tracking metrics BEFORE applying work
+        self.last_queue_size = self.waiting_queue.size()
+        self.last_workers_used = sum(allocation.values()) if allocation else 0
+        self.last_workers_available = self._effective_capacity()
+
+        # Apply work with stochastic progress
+        self._apply_work(allocation)
 
         # Remove completed houses
         completed = [
@@ -533,20 +749,39 @@ class BaseEnv(gym.Env):
         ]
         self.waiting_queue.remove(completed)
 
+        # Update waiting times
+        for house_id in completed:
+            self.waiting_time[house_id] = 0  # Reset for completed houses
+
+        for house_id in self.waiting_queue.get_all():
+            self.waiting_time[house_id] += 1  # Increment for waiting houses
+
         # Advance day
         self.day += 1
 
         # Calculate completion (only for revealed houses)
         revealed_ids = list(self.arrival_system.revealed_ids)
+
+        # Debug: track completion calculation
+        if self.day % 50 == 0 or self.day < 40:
+            print(f"    [DEBUG] Day {self.day}: Calculating completion...")
+            print(f"            revealed_ids length: {len(revealed_ids)}")
+            if len(revealed_ids) > 0:
+                completed_count = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
+                print(f"            completed houses: {completed_count}")
+                print(f"            completion: {completed_count / len(revealed_ids):.3f}")
+
         if len(revealed_ids) > 0:
             # Count completed houses
             revealed_completed = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
             completion = revealed_completed / len(revealed_ids)
         else:
             completion = 0.0
+            if self.day % 50 == 0:
+                print(f"            WARNING: revealed_ids is empty at day {self.day}!")
 
-        # Reward = completion delta
-        reward = completion - self.last_completion
+        # Calculate reward using new long-term reward function
+        reward = self._calculate_reward(completed)
         self.last_completion = completion
 
         # Check termination
@@ -560,11 +795,14 @@ class BaseEnv(gym.Env):
         obs = self._get_obs()
 
         info = {
-            "day": self.day,
+            "day": self.day,  # Keep for backward compatibility
+            "completed_days": self.day,  # More explicit: days 0 through day-1 are complete
+            "decision_day": self.day - 1 if self.day > 0 else 0,  # Day used for this step's decisions
             "completion": completion,
             "queue_size": self.waiting_queue.size(),
             "K": self._effective_capacity(),
             "revealed_count": self.arrival_system.get_revealed_count(),
+            "M": self._get_M(self.waiting_queue.size()),  # Actual M used this step
         }
 
         return obs, reward, terminated, truncated, info
@@ -575,7 +813,7 @@ class BaseEnv(gym.Env):
 
         Structure:
         - 6 global features
-        - M*4 candidate features
+        - M_max*4 candidate features (padded with zeros if M < M_max)
         """
         # Global features
         revealed_ids = list(self.arrival_system.revealed_ids)
@@ -600,14 +838,30 @@ class BaseEnv(gym.Env):
             major_ratio,
         ], dtype=np.float32)
 
-        # Candidate features
+        # Candidate features (use M_max for fixed size, pad with zeros)
         queue_ids = self.waiting_queue.get_all()
         candidates = self._select_candidates(queue_ids) if queue_ids else []
 
-        candidate_features = np.zeros((self.M, 4), dtype=np.float32)
-        for i, house_id in enumerate(candidates[:self.M]):
+        candidate_features = np.zeros((self.M_max, 4), dtype=np.float32)
+        for i, house_id in enumerate(candidates):
+            if i >= self.M_max:
+                break
+
+            # Get true remaining work
+            true_remain = self._arr_rem[house_id]
+
+            # Add observation noise if enabled
+            if self.obs_noise > 0:
+                # Noisy observation: true_value + N(0, σ * true_value)
+                # This models uncertainty in damage assessment
+                noise = self.rng.normal(0, true_remain * self.obs_noise)
+                observed_remain = max(0, true_remain + noise)
+            else:
+                # Perfect information (legacy mode)
+                observed_remain = true_remain
+
             candidate_features[i] = [
-                self._arr_rem[house_id],
+                observed_remain,
                 self._arr_dmg[house_id],
                 self._arr_cmax[house_id],
                 1.0  # mask: valid
@@ -642,10 +896,26 @@ class BaseEnv(gym.Env):
         self.day = 0
         self.last_completion = 0.0
 
+        # Reset long-term reward tracking
+        self.waiting_time = np.zeros(len(self.tasks_df), dtype=np.int32)
+        self.last_queue_size = 0
+        self.last_workers_used = 0
+        self.last_workers_available = 0
+
+
         # Initial batch arrival
         initial_arrivals = self.arrival_system.step_to_day(0)
+
+        # ===== 新增：Debug =====
+        print(f"[RESET DEBUG] Initial arrivals from arrival_system: {len(initial_arrivals)} houses")
+        print(f"[RESET DEBUG] Queue size before add: {self.waiting_queue.size()}")
+            # =======================
+
         if initial_arrivals:
             self.waiting_queue.add(initial_arrivals)
+        
+        # ===== 新增：Debug =====
+        print(f"[RESET DEBUG] Queue size after add: {self.waiting_queue.size()}")
 
         obs = self._get_obs()
         info = {"day": 0}
@@ -680,6 +950,14 @@ class RLEnv(BaseEnv):
         Returns:
             Allocation dictionary
         """
+         # ===== 新增：Debug =====
+        if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
+            print(f"    [RL ALLOC DEBUG] Day {self.day}:")
+            print(f"      K available: {K}")
+            print(f"      Candidates: {len(candidates)}")
+            if len(action) > 0:
+                print(f"      Action scores: min={action.min():.3f}, max={action.max():.3f}, mean={action.mean():.3f}")
+        # =======================
         # Extract valid scores
         valid_scores = action[:len(candidates)]
 
@@ -702,7 +980,11 @@ class RLEnv(BaseEnv):
             if give > 0:
                 allocation[house_id] = give
                 remaining_K -= give
-
+            # ===== 新增：Debug result =====
+        if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
+            print(f"      Result: {len(allocation)} houses allocated, {sum(allocation.values())} total workers")
+            if remaining_K > 0:
+                print(f"      ⚠️  {remaining_K} workers unused!")
         return allocation
 
 
@@ -717,8 +999,15 @@ class BaselineEnv(BaseEnv):
         region_key: str,
         policy: str,
         num_contractors: Optional[int] = None,
+        M_ratio: float = 0.10,
+        M_min: int = 512,
+        M_max: int = 2048,
         use_batch_arrival: bool = True,
         use_capacity_ramp: bool = True,
+        stochastic_duration: bool = True,
+        observation_noise: float = 0.15,
+        capacity_noise: float = 0.10,
+        use_longterm_reward: bool = True,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
     ):
@@ -732,8 +1021,15 @@ class BaselineEnv(BaseEnv):
         super().__init__(
             region_key=region_key,
             num_contractors=num_contractors,
+            M_ratio=M_ratio,
+            M_min=M_min,
+            M_max=M_max,
             use_batch_arrival=use_batch_arrival,
             use_capacity_ramp=use_capacity_ramp,
+            stochastic_duration=stochastic_duration,
+            observation_noise=observation_noise,
+            capacity_noise=capacity_noise,
+            use_longterm_reward=use_longterm_reward,
             seed=seed,
             max_steps=max_steps,
         )
@@ -812,8 +1108,15 @@ class OracleEnv(BaseEnv):
         region_key: str,
         policy: str,
         num_contractors: Optional[int] = None,
+        M_ratio: float = 0.10,
+        M_min: int = 512,
+        M_max: int = 2048,
         use_batch_arrival: bool = True,
         use_capacity_ramp: bool = True,
+        stochastic_duration: bool = True,
+        observation_noise: float = 0.15,
+        capacity_noise: float = 0.10,
+        use_longterm_reward: bool = True,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
     ):
@@ -827,8 +1130,15 @@ class OracleEnv(BaseEnv):
         super().__init__(
             region_key=region_key,
             num_contractors=num_contractors,
+            M_ratio=M_ratio,
+            M_min=M_min,
+            M_max=M_max,
             use_batch_arrival=use_batch_arrival,
             use_capacity_ramp=use_capacity_ramp,
+            stochastic_duration=stochastic_duration,
+            observation_noise=observation_noise,
+            capacity_noise=capacity_noise,
+            use_longterm_reward=use_longterm_reward,
             seed=seed,
             max_steps=max_steps,
         )
@@ -923,10 +1233,10 @@ class HousegymRLENV(RLEnv):
         queue_ids = self.waiting_queue.get_all()
         candidates = self._select_candidates(queue_ids) if queue_ids else []
 
-        remain = np.zeros(self.M, dtype=np.float32)
-        mask = np.zeros(self.M, dtype=np.float32)
+        remain = np.zeros(self.M_max, dtype=np.float32)
+        mask = np.zeros(self.M_max, dtype=np.float32)
 
-        for i, h in enumerate(candidates[:self.M]):
+        for i, h in enumerate(candidates[:self.M_max]):
             remain[i] = self._arr_rem[h]
             mask[i] = 1.0
 

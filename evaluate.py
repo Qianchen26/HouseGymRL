@@ -11,12 +11,16 @@ from stable_baselines3 import SAC
 
 # Import new environment classes
 from housegymrl import RLEnv, BaselineEnv, OracleEnv, HousegymRLENV
+
 from baseline import create_baseline_env, create_oracle_env
+import config
 from config import (
-    REGION_CONFIG, M_CANDIDATES, MAX_STEPS,
+    M_CANDIDATES, MAX_STEPS,
     register_synthetic_region, COMBINED_ARRIVAL_CAPACITY_CONFIG,
     DATA_DIR, OBSERVED_DATA_PATH
 )
+
+
 
 # ------------------- Config -------------------
 # Change this to your local path if needed
@@ -200,7 +204,7 @@ def make_region_env(
     Returns:
         RLEnv configured for the region
     """
-    if region_key not in REGION_CONFIG:
+    if region_key not in config.REGION_CONFIG:
         raise ValueError(f"Unknown region: {region_key}")
 
     return RLEnv(
@@ -312,7 +316,7 @@ def load_observed(DATA_PATH: str | Path) -> dict[str, pd.Series]:
         raise ValueError("DATA_PATH must be a .pkl of a DataFrame with DatetimeIndex.")
 
     out = {}
-    for region_name in REGION_CONFIG.keys():
+    for region_name in config.REGION_CONFIG.keys():
         if region_name.startswith("SYNTH"):  # Skip synthetic regions
             continue
         alias = REGION_ALIASES.get(region_name)
