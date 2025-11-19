@@ -13,7 +13,7 @@
 #SBATCH --time=04:00:00
 #SBATCH --gpus=1
 
-set -euo pipefail
+set -eo pipefail  # Removed -u to allow unbound variables in conda activation
 
 echo "======================================================================"
 echo "Evaluation job started on $(date)"
@@ -23,7 +23,10 @@ echo "======================================================================"
 
 module purge
 module load conda
-module load cuda/11.8 || module load cuda/12.1 || module load cuda/12.4 || true
+
+# Try to load CUDA (suppress errors if not available)
+module load cuda/12.4 2>/dev/null || module load cuda/12.1 2>/dev/null || module load cuda/11.8 2>/dev/null || echo "CUDA not loaded, will use CPU if available"
+
 conda activate urbanai
 
 BASE_DIR="/home/yu.qianchen/ondemand/housegymrl"
