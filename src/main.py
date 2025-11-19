@@ -917,11 +917,18 @@ print("STARTING SAC TRAINING")
 print("="*70)
 
 # Production training configuration
-# Adjust TOTAL_TIMESTEPS based on your needs:
-#   - 5M steps: ~1-2 episodes per env (10-15 hours)
-#   - 10M steps: ~2-4 episodes per env (20-30 hours)
-#   - 20M steps: ~4-8 episodes per env (40-60 hours)
-TOTAL_TIMESTEPS = 5_000_000
+# IMPORTANT: Each episode requires ~400k steps per environment!
+# With 8 parallel envs, episode completion schedule:
+#   - 5M steps: ~1-2 episodes per env (⚠️ TOO FEW for meaningful learning curve!)
+#   - 10M steps: ~3 episodes per env (minimum for basic trend)
+#   - 20M steps: ~6 episodes per env (better, ~56h / 2.3 days)
+#   - 32M steps: ~10 episodes per env (recommended, ~89h / 3.7 days)
+#   - 48M steps: ~15 episodes per env (good training, ~133h / 5.6 days)
+#   - 64M steps: ~20 episodes per env (solid training, ~178h / 7.4 days)
+#
+# For production research: Recommend 32M-64M steps for robust learning curves
+# For quick testing: 5M-10M steps just to verify code works
+TOTAL_TIMESTEPS = 5_000_000  # Current: Testing configuration
 
 print(f"\nTraining Configuration:")
 print(f"  Total timesteps: {TOTAL_TIMESTEPS:,}")
