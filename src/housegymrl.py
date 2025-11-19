@@ -276,8 +276,8 @@ class BaseEnv(gym.Env):
         use_batch_arrival: bool = True,
         use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
-        observation_noise: float = 0.15,
-        capacity_noise: float = 0.10,
+        observation_noise: float = 0.02,
+        capacity_noise: float = 0.02,
         use_longterm_reward: bool = True,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
@@ -294,8 +294,8 @@ class BaseEnv(gym.Env):
             use_batch_arrival: Whether to use batch arrival system
             use_capacity_ramp: Whether to use capacity ramp system
             stochastic_duration: Whether work progress is stochastic (default: True)
-            observation_noise: Std dev of observation noise as fraction of true value (default: 0.15)
-            capacity_noise: Range of capacity reduction (default: 0.10 = 90%-100% of base)
+            observation_noise: Std dev of observation noise as fraction of true value (default: 0.02)
+            capacity_noise: Range of capacity reduction (default: 0.02 = 98%-100% of base)
             use_longterm_reward: Whether to use long-term reward function (default: True)
             seed: Random seed
             max_steps: Maximum simulation days
@@ -370,6 +370,7 @@ class BaseEnv(gym.Env):
         # State variables
         self.day = 0
         self.last_completion = 0.0
+        self.last_completion_count = 0  # For tracking progress reward
 
         # Long-term reward tracking variables
         self.waiting_time = np.zeros(len(self.tasks_df), dtype=np.int32)
@@ -611,65 +612,98 @@ class BaseEnv(gym.Env):
             self._arr_rem[house_id] -= actual_progress
             self._arr_rem[house_id] = max(0, self._arr_rem[house_id])
 
-    def _calculate_reward(self, completed: List[int]) -> float:
+    def _queue_penalty_sigmoid(
+        self,
+        waiting_time: int,
+        midpoint: int = 50,
+        steepness: float = 0.1,
+        max_penalty: float = 0.1
+    ) -> float:
         """
-        Calculate long-term reward with multiple components.
+        Sigmoid penalty function for queue waiting time.
+
+        Penalty curve:
+        - waiting_time < midpoint: small penalty (gradual increase)
+        - waiting_time = midpoint: penalty = max_penalty / 2
+        - waiting_time >> midpoint: penalty → max_penalty (saturates)
+
+        Args:
+            waiting_time: Days the house has been waiting
+            midpoint: Inflection point (default: 50 days)
+            steepness: Controls how fast penalty grows (default: 0.1)
+            max_penalty: Maximum penalty value (default: 0.1)
+
+        Returns:
+            Negative penalty value (always ≤ 0)
+        """
+        penalty = max_penalty / (1 + np.exp(-steepness * (waiting_time - midpoint)))
+        return -penalty
+
+    def _calculate_reward(self, completed: List[int]) -> Dict[str, float]:
+        """
+        Calculate reward with four-component architecture (Reward V2).
 
         Components:
-        1. Completion reward: Houses completed (no damage weighting)
-        2. Queue reduction bonus: Encourages clearing the queue
-        3. Urgency penalty: Punishes long waiting times
-        4. Worker efficiency bonus: Encourages efficient resource use
+        1. Progress: Dense reward for houses completed this step (incremental)
+        2. Completion: Cumulative completion fraction (global state)
+        3. Queue Penalty: Sigmoid penalty for long waiting times
+        4. Capacity Usage: Resource utilization efficiency
 
         Args:
             completed: List of house IDs completed this step
 
         Returns:
-            Combined reward value
+            Dictionary with individual components and total scaled reward
         """
-        if not self.use_longterm_reward:
-            # Simple immediate reward (legacy mode)
-            revealed_ids = list(self.arrival_system.revealed_ids)
-            if len(revealed_ids) > 0:
-                return len(completed) / len(revealed_ids)
-            return 0.0
-
-        # Component 1: Immediate completion (NO damage weighting per user request)
-        completion_reward = 0.0
         revealed_ids = list(self.arrival_system.revealed_ids)
-        if len(revealed_ids) > 0:
-            completion_reward = len(completed) / len(revealed_ids)
+        num_revealed = len(revealed_ids)
 
-        # Component 2: Queue reduction bonus
-        current_queue = self.waiting_queue.size()
-        if self.last_queue_size > 0:
-            queue_reduction = (self.last_queue_size - current_queue) / self.last_queue_size
-            queue_bonus = max(0, queue_reduction) * 0.1
-        else:
-            queue_bonus = 0.0
+        # Component 1: Dense Progress (本步新完成的房屋)
+        # Incremental reward for houses completed in THIS step
+        current_completed = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
+        new_completed = max(0, current_completed - self.last_completion_count)
+        progress = new_completed / num_revealed if num_revealed > 0 else 0.0
 
-        # Component 3: Urgency penalty (punish long waits)
-        urgency_penalty = 0.0
+        # Component 2: Completion (累积完成比例)
+        # Global progress: total fraction of revealed houses completed
+        completion = current_completed / num_revealed if num_revealed > 0 else 0.0
+
+        # Component 3: Queue Penalty (sigmoid惩罚)
+        # Accumulate sigmoid penalties for all waiting houses
+        queue_penalty = 0.0
         for house_id in self.waiting_queue.get_all():
-            if self.waiting_time[house_id] > 50:  # Houses waiting > 50 days
-                urgency_penalty -= (self.waiting_time[house_id] - 50) / 10000
+            queue_penalty += self._queue_penalty_sigmoid(self.waiting_time[house_id])
 
-        # Component 4: Worker efficiency bonus
+        # Component 4: Capacity Usage (资源利用率)
+        # Fraction of available workers actually used
+        capacity_usage = 0.0
         if self.last_workers_available > 0:
-            efficiency = self.last_workers_used / self.last_workers_available
-            efficiency_bonus = efficiency * 0.03
-        else:
-            efficiency_bonus = 0.0
+            used_workers = self.last_workers_available - self.workers_available
+            capacity_usage = used_workers / self.last_workers_available
 
-        # Combine components with weights
-        total_reward = (
-            completion_reward * 1.0 +      # Main signal: complete houses
-            queue_bonus * 0.2 +             # Secondary: reduce queue
-            urgency_penalty * 0.1 +         # Penalty: avoid long waits
-            efficiency_bonus * 0.05         # Bonus: use workers efficiently
+        # Weighted combination (before scaling)
+        raw_reward = (
+            progress * 1.0 +           # Main signal: incremental progress
+            completion * 1.0 +         # Main signal: global completion
+            queue_penalty * 0.1 +      # Secondary: queue management
+            capacity_usage * 0.05      # Minor: resource efficiency
         )
 
-        return total_reward
+        # Scale up by 100x for better SAC learning dynamics
+        scaled_reward = raw_reward * 100.0
+
+        # Update state for next step
+        self.last_completion_count = current_completed
+
+        # Return all components for TensorBoard logging
+        return {
+            "total": scaled_reward,
+            "progress": progress,
+            "completion": completion,
+            "queue_penalty": queue_penalty,
+            "capacity_usage": capacity_usage,
+            "raw_total": raw_reward,
+        }
 
     def _select_candidates(self, queue_ids: List[int]) -> List[int]:
         """
@@ -834,8 +868,9 @@ class BaseEnv(gym.Env):
             # if self.day % 50 == 0:
             #     print(f"            WARNING: revealed_ids is empty at day {self.day}!")
 
-        # Calculate reward using new long-term reward function
-        reward = self._calculate_reward(completed)
+        # Calculate reward using new four-component reward function
+        reward_dict = self._calculate_reward(completed)
+        reward = reward_dict["total"]
         self.last_completion = completion
 
         # Check termination
@@ -857,6 +892,12 @@ class BaseEnv(gym.Env):
             "K": self.current_day_capacity,
             "revealed_count": self.arrival_system.get_revealed_count(),
             "M": self.current_day_initial_candidates,
+            # Reward components for TensorBoard logging
+            "reward_progress": reward_dict["progress"],
+            "reward_completion": reward_dict["completion"],
+            "reward_queue_penalty": reward_dict["queue_penalty"],
+            "reward_capacity_usage": reward_dict["capacity_usage"],
+            "reward_raw_total": reward_dict["raw_total"],
         }
 
         return obs, reward, terminated, truncated, info
@@ -948,6 +989,7 @@ class BaseEnv(gym.Env):
         self.waiting_queue = WaitingQueue()
         self.day = 0
         self.last_completion = 0.0
+        self.last_completion_count = 0
 
         # Reset long-term reward tracking
         self.waiting_time = np.zeros(len(self.tasks_df), dtype=np.int32)

@@ -829,9 +829,9 @@ model = SAC(
     "MlpPolicy",
     vec_env,
     learning_rate=3e-4,
-    buffer_size=1_000_000,      # Increased for longer training
-    batch_size=64,               # Fixed from previous debugging
-    learning_starts=5000,        # Increased warmup period
+    buffer_size=1_500_000,       # Increased for 500-step episodes (3000 episodes capacity)
+    batch_size=256,              # Reduced for initial stability
+    learning_starts=25_000,      # Wait for buffer to fill 5% before learning
     tau=0.005,
     gamma=0.99,
     train_freq=1,
@@ -847,9 +847,9 @@ print("\n✅ SAC model created successfully!")
 print(f"\nModel Configuration:")
 print(f"  Policy: MlpPolicy")
 print(f"  Learning rate: 3e-4")
-print(f"  Buffer size: 1,000,000")
-print(f"  Batch size: 64")
-print(f"  Learning starts: 5,000")
+print(f"  Buffer size: 1,500,000")
+print(f"  Batch size: 256")
+print(f"  Learning starts: 25,000")
 print(f"  Gamma: 0.99")
 print(f"  Entropy coefficient: auto")
 print(f"  Verbose: 1")
@@ -863,6 +863,34 @@ print(f"  Device: {model.device}")
 print("="*70)
 print("SETTING UP TRAINING CALLBACKS")
 print("="*70)
+
+# Reward component logger for TensorBoard
+class RewardComponentLogger(BaseCallback):
+    """
+    Logs individual reward components to TensorBoard for analysis.
+    Components: progress, completion, queue_penalty, capacity_usage.
+    """
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+
+    def _on_step(self) -> bool:
+        # Check if we have info from the latest step
+        if len(self.locals.get("infos", [])) > 0:
+            info = self.locals["infos"][0]
+
+            # Log reward components if they exist
+            if "reward_progress" in info:
+                self.logger.record("reward/progress", info["reward_progress"])
+            if "reward_completion" in info:
+                self.logger.record("reward/completion", info["reward_completion"])
+            if "reward_queue_penalty" in info:
+                self.logger.record("reward/queue_penalty", info["reward_queue_penalty"])
+            if "reward_capacity_usage" in info:
+                self.logger.record("reward/capacity_usage", info["reward_capacity_usage"])
+            if "reward_raw_total" in info:
+                self.logger.record("reward/raw_total", info["reward_raw_total"])
+
+        return True
 
 # Custom callback to monitor and log training
 class TrainingLoggerCallback(BaseCallback):
@@ -892,6 +920,8 @@ class TrainingLoggerCallback(BaseCallback):
         return True
 
 # Create callbacks
+reward_logger = RewardComponentLogger(verbose=0)  # Log reward components every step
+
 training_logger = TrainingLoggerCallback(log_freq=5000, verbose=1)  # Log every 5000 steps
 
 checkpoint_callback = CheckpointCallback(
@@ -900,10 +930,11 @@ checkpoint_callback = CheckpointCallback(
     name_prefix='sac_diverse',
     verbose=1
 )
+print("✅ Reward component logger configured (every step)")
 print("✅ Checkpoint callback configured (every 50k steps)")
 print("✅ Training logger callback configured (every 5k steps)")
 
-callbacks = [training_logger, checkpoint_callback]
+callbacks = [reward_logger, training_logger, checkpoint_callback]
 
 print(f"\n✅ {len(callbacks)} callback(s) ready for training")
 
