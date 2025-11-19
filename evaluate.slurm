@@ -43,10 +43,14 @@ cd "${BASE_DIR}/src"
 echo ""
 echo "Environment Diagnostics:"
 echo "  Python: $(which python)"
-python -c "import numpy; print(f'  ✅ NumPy {numpy.__version__} loaded')" || {
-    echo "  ❌ NumPy import failed - reinstalling..."
-    pip uninstall -y numpy && pip install --no-cache-dir numpy==2.0.2
-}
+echo "  Working directory: $(pwd)"
+if ! python -c "import numpy; print(f'  ✅ NumPy {numpy.__version__} loaded')" 2>&1; then
+    echo ""
+    echo "❌ ERROR: NumPy import failed on compute node!"
+    echo "Please fix the conda environment on the login node before resubmitting."
+    echo ""
+    exit 1
+fi
 echo ""
 
 DATASET_PATH="../results/synthetic_training_dataset.csv"

@@ -49,13 +49,19 @@ echo "  Python: $(which python)"
 echo "  Working directory: $(pwd)"
 python -c "import sys; print(f'  Python path: {sys.path[0]}')"
 echo "  Testing numpy import..."
-python -c "import numpy; print(f'  ✅ NumPy {numpy.__version__} loaded successfully')" || {
-    echo "  ❌ NumPy import failed!"
-    echo "  Attempting to fix numpy installation..."
-    pip uninstall -y numpy
-    pip install --no-cache-dir numpy==2.0.2
-    python -c "import numpy; print(f'  ✅ NumPy {numpy.__version__} reinstalled')"
-}
+if ! python -c "import numpy; print(f'  ✅ NumPy {numpy.__version__} loaded successfully')" 2>&1; then
+    echo ""
+    echo "❌ ERROR: NumPy import failed on compute node!"
+    echo "Please fix the conda environment on the login node before resubmitting:"
+    echo ""
+    echo "  On login node, run:"
+    echo "    conda activate urbanai"
+    echo "    pip uninstall -y numpy scipy"
+    echo "    pip install --no-cache-dir numpy==2.0.2 scipy"
+    echo "    python -c 'import numpy, scipy; print(\"✅ Fixed\")'"
+    echo ""
+    exit 1
+fi
 echo ""
 
 DATASET_PATH="../results/synthetic_training_dataset.csv"
