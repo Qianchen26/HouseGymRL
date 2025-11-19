@@ -19,9 +19,8 @@ CMAX_BY_LEVEL = {0: 2, 1: 4, 2: 6}
 COMBINED_ARRIVAL_CAPACITY_CONFIG = {
     # Batch arrival: Houses revealed over time
     "batch_arrival": {
-        "days": [0, 21, 36],  # Days when new batches arrive
+        "days": [0, 30, 60],  # Days when new batches arrive
         "ratios": [0.40, 0.35, 0.25],  # Proportion of houses in each batch
-        "damage_priority": [2, 1, 0],  # Assessment order: major → moderate → minor
     },
 
     # Capacity ramp: Reconstruction crew availability over time
@@ -31,6 +30,9 @@ COMBINED_ARRIVAL_CAPACITY_CONFIG = {
         "full_capacity_day": 216,  # Day 216+: K = max
     }
 }
+
+# Temporary switch: disable capacity ramp (forces fixed capacity even if configs exist)
+CAPACITY_RAMP_ENABLED = False
 
 # ============================================================================
 # Candidate Selection Strategy
@@ -50,7 +52,7 @@ CANDIDATE_SELECTION = "pure_random"  # The only strategy - no configuration need
 
 # Environment sizing constants
 M_CANDIDATES = 512  # Increased from 256 to 512 for better capacity utilization
-MAX_STEPS = 1500
+MAX_STEPS = 500
 OBS_G = 6
 OBS_F = 4
 EXPECTED_OBS_DIM = OBS_G + M_CANDIDATES * OBS_F  # Now 6 + 512*4 = 2054 dimensions
@@ -136,7 +138,13 @@ OBSERVED_DATA_PATH = DATA_DIR / "lombok_data.pkl"
 # ============================================================================
 # Support for Synthetic Scenarios
 # ============================================================================
-def register_synthetic_region(H: int, K: int, damage_dist: list, seed: int = None):
+def register_synthetic_region(
+    H: int,
+    K: int,
+    damage_dist: list,
+    seed: int | None = None,
+    region_key: str | None = None,
+):
     """
     Register a synthetic region dynamically for training.
 
@@ -149,7 +157,8 @@ def register_synthetic_region(H: int, K: int, damage_dist: list, seed: int = Non
     Returns:
         str: Region key for the synthetic scenario
     """
-    region_key = f"SYNTH_{H}_{K}_{seed if seed else 'random'}"
+    if region_key is None:
+        region_key = f"SYNTH_{H}_{K}_{seed if seed else 'random'}"
     REGION_CONFIG[region_key] = {
         "damage_dist": damage_dist,
         "num_contractors": K,

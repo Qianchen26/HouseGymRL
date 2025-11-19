@@ -37,7 +37,7 @@ def create_baseline_env(
     policy: str,
     num_contractors: Optional[int] = None,
     use_batch_arrival: bool = True,
-    use_capacity_ramp: bool = True,
+    use_capacity_ramp: bool = False,
     seed: Optional[int] = None,
 ) -> BaselineEnv:
     """
@@ -69,7 +69,7 @@ def create_oracle_env(
     policy: str,
     num_contractors: Optional[int] = None,
     use_batch_arrival: bool = True,
-    use_capacity_ramp: bool = True,
+    use_capacity_ramp: bool = False,
     seed: Optional[int] = None,
 ) -> OracleEnv:
     """
@@ -123,23 +123,32 @@ def run_baseline_rollout(
     env.reset()
 
     completion_curve = []
-    day = 0
+    simulated_days = 0
 
-    while day < max_days:
+    while simulated_days < max_days:
         _, _, terminated, truncated, info = env.step(None)
 
-        completion = info.get('completion', 0.0)
-        completion_curve.append(completion)
+        if info.get('day_advanced', False):
+            completion = info.get('completion', 0.0)
+            completion_curve.append(completion)
 
-        if verbose and day % 100 == 0:
-            print(f"Day {day}: {completion:.1%} complete, Queue: {info.get('queue_size', 0)}")
+            if verbose and simulated_days % 100 == 0:
+                print(f"Day {simulated_days}: {completion:.1%} complete, Queue: {info.get('queue_size', 0)}")
+
+            simulated_days += 1
 
         if terminated or truncated:
             break
 
-        day += 1
-
     completion_curve = np.array(completion_curve)
+
+    if len(completion_curve) == 0:
+        return {
+            'completion_curve': completion_curve,
+            'final_completion': 0.0,
+            'makespan': 0,
+            'total_days': 0,
+        }
 
     # Calculate makespan (days to reach 100%)
     if completion_curve[-1] >= 0.99:

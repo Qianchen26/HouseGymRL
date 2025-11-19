@@ -1,18 +1,66 @@
+# Python
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+*.ipynb
+
+# Virtual Environment
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+
+# Training Artifacts (Large files - should not be in git)
 runs/
+models/
+artifacts/
 output/
-*.npz
+results/*.csv
+results/*.pkl
+results/*.xlsx
+
+# Keep important result files but ignore large data
+!results/.gitkeep
+
+# Data files (usually too large)
+data/
 *.pkl
+*.npz
+*.h5
+*.hdf5
 *.zip
 *.tfevents.*
-__pycache__/
-*.py[cod]
-.DS_Store
-runs/
-output/
-*.npz
-*.pkl
-*.zip
-*.tfevents.*
+
+# Logs
+*.log
+*.out
+*.err
+
+# SLURM output files
+slurm-*.out
+
+# Archive and old files
+archive/
+old/
+
+# Temporary files
+*.tmp
+*.temp

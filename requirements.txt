@@ -1,0 +1,25 @@
+# HouseGym RL Training Dependencies
+# For HiPerGator HPC Environment
+
+# Core RL Framework
+stable-baselines3==2.2.1
+gymnasium==0.29.1
+
+# Deep Learning Backend
+torch>=2.0.0
+tensorboard>=2.15.0
+
+# Scientific Computing
+numpy>=1.24.0
+pandas>=2.0.0
+scipy>=1.11.0
+
+# Visualization (for result analysis)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Data Processing
+openpyxl>=3.1.0  # For Excel files if needed
+
+# Utilities
+tqdm>=4.65.0

@@ -134,7 +134,7 @@ def make_synth_env(
     seed: int | None = None,
     verbose: bool = False,
     use_batch_arrival: bool = True,  # Use new features for training
-    use_capacity_ramp: bool = True,
+    use_capacity_ramp: bool = False,
 ) -> RLEnv:
     """
     Create a synthetic environment for training.
@@ -189,7 +189,7 @@ def make_synth_env(
 def make_region_env(
     region_key: str,
     use_batch_arrival: bool = True,
-    use_capacity_ramp: bool = True,
+    use_capacity_ramp: bool = False,
     seed: Optional[int] = None
 ) -> RLEnv:
     """
@@ -384,8 +384,9 @@ def rollout(
     """
     obs, info = env.reset()
     traj = []
+    simulated_days = 0
 
-    for _ in range(max_days):
+    while simulated_days < max_days:
         if isinstance(env, RLEnv) and model is not None:
             action, _ = model.predict(obs, deterministic=True)
         else:
@@ -393,8 +394,9 @@ def rollout(
 
         obs, r, done, trunc, info = env.step(action)
 
-        # Record completion
-        traj.append(info.get("completion", 0.0))
+        if info.get("day_advanced", False):
+            traj.append(info.get("completion", 0.0))
+            simulated_days += 1
 
         if done or trunc:
             break

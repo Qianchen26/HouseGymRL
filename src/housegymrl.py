@@ -69,44 +69,38 @@ class TrueBatchArrival:
         self.revealed_ids = set()
         self.current_day = -1
 
-        # Group houses by damage level
-        major = tasks_df[tasks_df['damage_level'] == 2].index.tolist()
-        moderate = tasks_df[tasks_df['damage_level'] == 1].index.tolist()
-        minor = tasks_df[tasks_df['damage_level'] == 0].index.tolist()
-
-        # Shuffle within each group (assessment order is random within priority)
-        self.rng.shuffle(major)
-        self.rng.shuffle(moderate)
-        self.rng.shuffle(minor)
-
-        # Assign to batches based on damage priority
+        # Shuffle all houses and split them purely by ratios (no severity bias)
         days = config["days"]
         ratios = config["ratios"]
+        if len(days) != len(ratios):
+            raise ValueError("Batch arrival config must have matching days and ratios")
 
-        # Batch 1: Mostly major damage (emergency response)
-        n_major_1 = int(len(major) * 0.7)
-        n_moderate_1 = int(len(moderate) * 0.1)
-        batch1 = major[:n_major_1] + moderate[:n_moderate_1]
+        all_ids = tasks_df.index.tolist()
+        self.rng.shuffle(all_ids)
 
-        # Batch 2: Remaining major + most moderate
-        n_major_2 = len(major) - n_major_1
-        n_moderate_2 = int(len(moderate) * 0.6)
-        batch2 = major[n_major_1:] + moderate[n_moderate_1:n_moderate_1+n_moderate_2]
+        total = len(all_ids)
+        ratios_arr = np.asarray(ratios, dtype=float)
+        float_counts = ratios_arr * total
+        batch_sizes = np.floor(float_counts).astype(int)
+        remainder = total - int(batch_sizes.sum())
+        if remainder > 0:
+            fractional = float_counts - batch_sizes
+            order = np.argsort(-fractional)
+            for idx in order[:remainder]:
+                batch_sizes[idx] += 1
 
-        # Batch 3: Remaining moderate + all minor
-        batch3 = moderate[n_moderate_1+n_moderate_2:] + minor
+        schedule = {}
+        cursor = 0
+        for day, size in zip(days, batch_sizes.tolist()):
+            batch = all_ids[cursor:cursor + size]
+            cursor += size
+            schedule[day] = batch
 
-        # Ensure all houses are assigned
-        all_houses = set(batch1 + batch2 + batch3)
-        missing = set(tasks_df.index.tolist()) - all_houses
-        if missing:
-            batch3.extend(list(missing))
+        # Safety: assign any leftover houses to the last batch
+        if cursor < total:
+            schedule[days[-1]].extend(all_ids[cursor:])
 
-        self.schedule = {
-            days[0]: batch1,
-            days[1]: batch2,
-            days[2]: batch3,
-        }
+        self.schedule = schedule
 
     def step_to_day(self, day: int) -> List[int]:
         """
@@ -120,20 +114,20 @@ class TrueBatchArrival:
         for scheduled_day, houses in self.schedule.items():
             if scheduled_day <= day and scheduled_day > self.current_day:
                 # Debug: print what's happening
-                if len(houses) > 0:
-                    print(f"    [DEBUG] Day {day}: Batch at day {scheduled_day} releasing {len(houses)} houses")
-                    print(f"            Before: revealed_ids has {len(self.revealed_ids)} houses")
-                
+                # if len(houses) > 0:
+                #     print(f"    [DEBUG] Day {day}: Batch at day {scheduled_day} releasing {len(houses)} houses")
+                #     print(f"            Before: revealed_ids has {len(self.revealed_ids)} houses")
+
                 new_arrivals.extend(houses)
                 self.revealed_ids.update(houses)
-                
-                if len(houses) > 0:
-                    print(f"            After:  revealed_ids has {len(self.revealed_ids)} houses")
+
+                # if len(houses) > 0:
+                #     print(f"            After:  revealed_ids has {len(self.revealed_ids)} houses")
 
         self.current_day = day
-        
-        if len(new_arrivals) > 0:
-            print(f"    [DEBUG] Day {day}: Total new arrivals = {len(new_arrivals)}, revealed_ids total = {len(self.revealed_ids)}")
+
+        # if len(new_arrivals) > 0:
+        #     print(f"    [DEBUG] Day {day}: Total new arrivals = {len(new_arrivals)}, revealed_ids total = {len(self.revealed_ids)}")
         
         return new_arrivals
 
@@ -265,7 +259,7 @@ class BaseEnv(gym.Env):
 
     Key features:
     - Batch arrival (information gradually revealed)
-    - Capacity ramp (resources gradually available)
+    - Capacity ramp (resources gradually available, currently disabled)
     - Pure random candidate selection (no artificial bias)
     - Fair constraints for all strategies (RL/baseline)
     """
@@ -280,7 +274,7 @@ class BaseEnv(gym.Env):
         M_min: int = 512,
         M_max: int = 2048,
         use_batch_arrival: bool = True,
-        use_capacity_ramp: bool = True,
+        use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
         observation_noise: float = 0.15,
         capacity_noise: float = 0.10,
@@ -355,7 +349,14 @@ class BaseEnv(gym.Env):
         else:
             self.arrival_system = StaticArrival(self.tasks_df)
 
-        if use_capacity_ramp:
+        self.use_capacity_ramp = bool(use_capacity_ramp and config.CAPACITY_RAMP_ENABLED)
+        if use_capacity_ramp and not self.use_capacity_ramp:
+            warnings.warn(
+                "Capacity ramp requested but globally disabled; using fixed capacity.",
+                UserWarning,
+            )
+
+        if self.use_capacity_ramp:
             self.capacity_system = CapacityRamp(
                 num_contractors,
                 COMBINED_ARRIVAL_CAPACITY_CONFIG["capacity_ramp"]
@@ -375,6 +376,14 @@ class BaseEnv(gym.Env):
         self.last_queue_size = 0
         self.last_workers_used = 0
         self.last_workers_available = 0
+
+        # Intra-day tracking state
+        self.pending_candidates: List[int] = []
+        self.pending_allocation: Dict[int, int] = {}
+        self.capacity_remaining: int = 0
+        self.current_day_capacity: int = 0
+        self.step_in_day: int = 0
+        self.current_day_initial_candidates: int = 0
 
         # Define spaces
         self._define_spaces()
@@ -457,34 +466,88 @@ class BaseEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Action: M_max continuous scores [0,1]
+        # Action: M_max candidate scores + 1 no-op signal
         self.action_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.M_max,),
+            shape=(self.M_max + 1,),
             dtype=np.float32
         )
 
+    def _build_action_mask(self) -> np.ndarray:
+        """Build an action mask for the current pending candidates."""
+        mask = np.zeros(self.M_max + 1, dtype=np.float32)
+        num_candidates = min(len(self.pending_candidates), self.M_max)
+        if num_candidates > 0:
+            mask[:num_candidates] = 1.0
+        mask[self.M_max] = 1.0  # no-op always allowed
+        return mask
+
+    def _get_capacity_for_day(self, day: int) -> int:
+        """Sample capacity for a specific day (with noise if enabled)."""
+        base_capacity = self.capacity_system.get_capacity(day)
+        if self.capacity_noise > 0 and base_capacity > 0:
+            noise_factor = self.rng.uniform(1.0 - self.capacity_noise, 1.0)
+            base_capacity = int(base_capacity * noise_factor)
+        return max(0, base_capacity)
+
     def _effective_capacity(self) -> int:
         """
-        Get current effective capacity with stochastic variation.
-
-        Returns base capacity from ramp system, with random noise applied
-        if capacity_noise > 0.
-
-        Returns:
-            Number of available contractors (with noise if enabled)
+        Return the capacity sampled for the current day (for logging).
         """
-        base_capacity = self.capacity_system.get_capacity(self.day)
+        return self.current_day_capacity
 
-        if self.capacity_noise > 0 and base_capacity > 0:
-            # Add random variation: (1 - noise) to 1.0 of base
-            # e.g., noise=0.10 → 90% to 100% of base capacity
-            noise_factor = self.rng.uniform(1.0 - self.capacity_noise, 1.0)
-            actual_capacity = int(base_capacity * noise_factor)
-            return max(0, actual_capacity)
+    def _begin_day_if_needed(self) -> None:
+        """Initialize per-day state if we are starting a new day."""
+        if not (self.capacity_remaining <= 0 and self.step_in_day == 0 and not self.pending_allocation):
+            return
 
-        return base_capacity
+        # Reveal new houses for this day
+        new_arrivals = self.arrival_system.step_to_day(self.day)
+        if new_arrivals:
+            self.waiting_queue.add(new_arrivals)
+
+        # Sample capacity for the day
+        capacity = self._get_capacity_for_day(self.day)
+        self.capacity_remaining = capacity
+        self.current_day_capacity = capacity
+        self.current_day_initial_candidates = 0
+        self.pending_allocation = {}
+        self.pending_candidates = []
+        self.step_in_day = 0
+
+        # No tasks or no capacity → nothing to do until advance
+        if capacity <= 0 or self.waiting_queue.size() == 0:
+            return
+
+        # Sample today's candidate set once
+        queue_ids = self.waiting_queue.get_all()
+        candidates = self._select_candidates(queue_ids)
+        self.pending_candidates = candidates.copy()
+        self.current_day_initial_candidates = len(self.pending_candidates)
+
+    def _advance_day(self):
+        """Apply accumulated allocation and move to the next day."""
+        allocation = dict(self.pending_allocation)
+        obs, reward, terminated, truncated, info = self._execute_allocation(allocation)
+
+        # Reset intra-day state
+        self.pending_candidates = []
+        self.pending_allocation = {}
+        self.capacity_remaining = 0
+        self.current_day_capacity = 0
+        self.current_day_initial_candidates = 0
+        self.step_in_day = 0
+
+        info["day_advanced"] = True
+        info["step_in_day"] = 0
+
+        if not terminated and not truncated:
+            self._begin_day_if_needed()
+            obs = self._get_obs()
+
+        info["action_mask"] = self._build_action_mask()
+        return obs, reward, terminated, truncated, info
 
     @property
     def decision_day(self) -> int:
@@ -642,55 +705,67 @@ class BaseEnv(gym.Env):
         return selected.tolist()
 
     def step(self, action):
-        """
-        Execute one day of reconstruction.
+        """Execute one intra-day decision (choose next house or end the day)."""
+        # Initialize a new day if needed
+        self._begin_day_if_needed()
 
-        Steps:
-        1. Check for new arrivals (batch system)
-        2. Get current capacity (ramp system)
-        3. Select candidates (pure random)
-        4. Allocate workers (subclass-specific)
-        5. Update state and calculate reward
-        """
-        # Step 1: Check new arrivals
-        new_arrivals = self.arrival_system.step_to_day(self.day)
-        if new_arrivals:
-            self.waiting_queue.add(new_arrivals)
+        # Nothing to do → advance day immediately
+        if self.capacity_remaining <= 0 or self.waiting_queue.size() == 0 or len(self.pending_candidates) == 0:
+            return self._advance_day()
 
-        # Step 2: Get current capacity
-        K_available = self._effective_capacity()
-
-        # Step 3: Handle zero capacity (planning phase)
-        if K_available == 0:
-            self.day += 1
-            obs = self._get_obs()
-            reward = 0.0
-            terminated = False
-            truncated = self.day >= self.max_steps
-            info = {
-                "day": self.day,  # Keep for backward compatibility
-                "completed_days": self.day,
-                "decision_day": self.day - 1 if self.day > 0 else 0,
-                "K": 0,
-                "queue_size": self.waiting_queue.size(),
-                "completion": self.last_completion,
-                "M": self._get_M(self.waiting_queue.size()),  # Actual M this step
-            }
-            return obs, reward, terminated, truncated, info
-
-        # Step 4: Allocation logic
-        queue_ids = self.waiting_queue.get_all()
-
-        if len(queue_ids) == 0:
-            # Empty queue
-            allocation = {}
+        # Determine selection source (RL vs. baseline)
+        if action is None:
+            chosen_house_id, is_noop = self._baseline_pick_next()
         else:
-            # Select candidates and allocate
-            candidates = self._select_candidates(queue_ids)
-            allocation = self._allocate_from_candidates(candidates, action, K_available)
+            candidates_view = self.pending_candidates[:self.M_max]
+            chosen_house_id, is_noop = self._allocate_from_candidates(
+                candidates_view,
+                action,
+                self.capacity_remaining,
+            )
 
-        # Step 5: Execute allocation
-        return self._execute_allocation(allocation)
+        # If policy decides to end the day (or nothing to choose)
+        if is_noop or chosen_house_id is None:
+            return self._advance_day()
+
+        # Allocate as many workers as possible to the selected house
+        cmax = int(np.ceil(self._arr_cmax[chosen_house_id]))
+        remain = int(np.ceil(self._arr_rem[chosen_house_id]))
+        give = min(cmax, remain, self.capacity_remaining)
+
+        if give > 0:
+            self.pending_allocation[chosen_house_id] = (
+                self.pending_allocation.get(chosen_house_id, 0) + give
+            )
+            self.capacity_remaining -= give
+
+        # Remove the house from today's candidate set
+        if chosen_house_id in self.pending_candidates:
+            self.pending_candidates.remove(chosen_house_id)
+
+        # End of day conditions
+        if self.capacity_remaining <= 0 or len(self.pending_candidates) == 0:
+            return self._advance_day()
+
+        # Otherwise remain in the same day (reward=0)
+        self.step_in_day += 1
+        obs = self._get_obs()
+        reward = 0.0
+        terminated = False
+        truncated = False
+        info = {
+            "day": self.day,
+            "day_advanced": False,
+            "step_in_day": self.step_in_day,
+            "K_remaining": self.capacity_remaining,
+            "queue_size": self.waiting_queue.size(),
+            "completion": self.last_completion,
+            "M": len(self.pending_candidates),
+            "decision_day": self.day,
+            "revealed_count": self.arrival_system.get_revealed_count(),
+            "action_mask": self._build_action_mask(),
+        }
+        return obs, reward, terminated, truncated, info
 
     def _allocate_from_candidates(
         self,
@@ -712,6 +787,10 @@ class BaseEnv(gym.Env):
         """
         raise NotImplementedError("Subclass must implement _allocate_from_candidates")
 
+    def _baseline_pick_next(self) -> Tuple[Optional[int], bool]:
+        """Baseline policies override this to pick a house or end the day."""
+        raise NotImplementedError("Baseline environments must implement _baseline_pick_next")
+
     def _execute_allocation(self, allocation: Dict[int, int]):
         """
         Execute allocation and update state.
@@ -723,21 +802,21 @@ class BaseEnv(gym.Env):
             Standard gym step outputs
         """
         # ===== 新增：Debug allocation =====
-        if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
-            print(f"    [ALLOCATION DEBUG] Day {self.day}:")
-            print(f"      Allocation dict size: {len(allocation)}")
-            if len(allocation) > 0:
-                total_workers = sum(allocation.values())
-                print(f"      Total workers allocated: {total_workers}")
-                print(f"      Sample allocations: {list(allocation.items())[:3]}")
-            else:
-                print(f"      ⚠️  Allocation is EMPTY!")
+        # if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
+        #     print(f"    [ALLOCATION DEBUG] Day {self.day}:")
+        #     print(f"      Allocation dict size: {len(allocation)}")
+        #     if len(allocation) > 0:
+        #         total_workers = sum(allocation.values())
+        #         print(f"      Total workers allocated: {total_workers}")
+        #         print(f"      Sample allocations: {list(allocation.items())[:3]}")
+        #     else:
+        #         print(f"      ⚠️  Allocation is EMPTY!")
         # ==================================
 
         # Update tracking metrics BEFORE applying work
         self.last_queue_size = self.waiting_queue.size()
         self.last_workers_used = sum(allocation.values()) if allocation else 0
-        self.last_workers_available = self._effective_capacity()
+        self.last_workers_available = self.current_day_capacity
 
         # Apply work with stochastic progress
         self._apply_work(allocation)
@@ -763,13 +842,13 @@ class BaseEnv(gym.Env):
         revealed_ids = list(self.arrival_system.revealed_ids)
 
         # Debug: track completion calculation
-        if self.day % 50 == 0 or self.day < 40:
-            print(f"    [DEBUG] Day {self.day}: Calculating completion...")
-            print(f"            revealed_ids length: {len(revealed_ids)}")
-            if len(revealed_ids) > 0:
-                completed_count = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
-                print(f"            completed houses: {completed_count}")
-                print(f"            completion: {completed_count / len(revealed_ids):.3f}")
+        # if self.day % 50 == 0 or self.day < 40:
+        #     print(f"    [DEBUG] Day {self.day}: Calculating completion...")
+        #     print(f"            revealed_ids length: {len(revealed_ids)}")
+        #     if len(revealed_ids) > 0:
+        #         completed_count = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
+        #         print(f"            completed houses: {completed_count}")
+        #         print(f"            completion: {completed_count / len(revealed_ids):.3f}")
 
         if len(revealed_ids) > 0:
             # Count completed houses
@@ -777,8 +856,8 @@ class BaseEnv(gym.Env):
             completion = revealed_completed / len(revealed_ids)
         else:
             completion = 0.0
-            if self.day % 50 == 0:
-                print(f"            WARNING: revealed_ids is empty at day {self.day}!")
+            # if self.day % 50 == 0:
+            #     print(f"            WARNING: revealed_ids is empty at day {self.day}!")
 
         # Calculate reward using new long-term reward function
         reward = self._calculate_reward(completed)
@@ -800,9 +879,9 @@ class BaseEnv(gym.Env):
             "decision_day": self.day - 1 if self.day > 0 else 0,  # Day used for this step's decisions
             "completion": completion,
             "queue_size": self.waiting_queue.size(),
-            "K": self._effective_capacity(),
+            "K": self.current_day_capacity,
             "revealed_count": self.arrival_system.get_revealed_count(),
-            "M": self._get_M(self.waiting_queue.size()),  # Actual M used this step
+            "M": self.current_day_initial_candidates,
         }
 
         return obs, reward, terminated, truncated, info
@@ -831,7 +910,7 @@ class BaseEnv(gym.Env):
 
         global_features = np.array([
             self.day / max(1.0, self.max_steps),
-            float(self._effective_capacity()),
+            float(self.capacity_remaining),
             float(self.waiting_queue.size()),
             float(len(revealed_ids)),
             remain_ratio,
@@ -839,8 +918,7 @@ class BaseEnv(gym.Env):
         ], dtype=np.float32)
 
         # Candidate features (use M_max for fixed size, pad with zeros)
-        queue_ids = self.waiting_queue.get_all()
-        candidates = self._select_candidates(queue_ids) if queue_ids else []
+        candidates = self.pending_candidates if self.pending_candidates else []
 
         candidate_features = np.zeros((self.M_max, 4), dtype=np.float32)
         for i, house_id in enumerate(candidates):
@@ -901,24 +979,38 @@ class BaseEnv(gym.Env):
         self.last_queue_size = 0
         self.last_workers_used = 0
         self.last_workers_available = 0
+        self.pending_candidates = []
+        self.pending_allocation = {}
+        self.capacity_remaining = 0
+        self.current_day_capacity = 0
+        self.step_in_day = 0
+        self.current_day_initial_candidates = 0
 
 
         # Initial batch arrival
         initial_arrivals = self.arrival_system.step_to_day(0)
 
         # ===== 新增：Debug =====
-        print(f"[RESET DEBUG] Initial arrivals from arrival_system: {len(initial_arrivals)} houses")
-        print(f"[RESET DEBUG] Queue size before add: {self.waiting_queue.size()}")
-            # =======================
+        # print(f"[RESET DEBUG] Initial arrivals from arrival_system: {len(initial_arrivals)} houses")
+        # print(f"[RESET DEBUG] Queue size before add: {self.waiting_queue.size()}")
+        # =======================
 
         if initial_arrivals:
             self.waiting_queue.add(initial_arrivals)
-        
+
         # ===== 新增：Debug =====
-        print(f"[RESET DEBUG] Queue size after add: {self.waiting_queue.size()}")
+        # print(f"[RESET DEBUG] Queue size after add: {self.waiting_queue.size()}")
+
+        # Prepare the first day so observations reflect valid candidates
+        self._begin_day_if_needed()
 
         obs = self._get_obs()
-        info = {"day": 0}
+        info = {
+            "day": 0,
+            "day_advanced": False,
+            "step_in_day": 0,
+            "action_mask": self._build_action_mask(),
+        }
 
         return obs, info
 
@@ -938,54 +1030,34 @@ class RLEnv(BaseEnv):
         candidates: List[int],
         action: np.ndarray,
         K: int
-    ) -> Dict[int, int]:
+    ) -> Tuple[Optional[int], bool]:
         """
-        Allocate based on RL-predicted scores.
-
-        Args:
-            candidates: Selected M candidates
-            action: Continuous scores [0,1]^M
-            K: Available capacity
+        Pick a single candidate (or no-op) based on action scores.
 
         Returns:
-            Allocation dictionary
+            (house_id, is_noop)
         """
-         # ===== 新增：Debug =====
-        if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
-            print(f"    [RL ALLOC DEBUG] Day {self.day}:")
-            print(f"      K available: {K}")
-            print(f"      Candidates: {len(candidates)}")
-            if len(action) > 0:
-                print(f"      Action scores: min={action.min():.3f}, max={action.max():.3f}, mean={action.mean():.3f}")
-        # =======================
-        # Extract valid scores
-        valid_scores = action[:len(candidates)]
+        num_candidates = len(candidates)
+        if num_candidates == 0 or K <= 0:
+            return None, True
 
-        # Sort by score (descending)
-        sorted_indices = np.argsort(-valid_scores)
-        sorted_candidates = [candidates[i] for i in sorted_indices]
+        candidate_scores = action[:num_candidates]
+        noop_index = self.M_max if self.M_max < len(action) else len(action) - 1
+        noop_score = float(action[noop_index])
 
-        # Greedy allocation
-        allocation = {}
-        remaining_K = K
+        # if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
+        #     print(f"    [RL ALLOC DEBUG] Day {self.day}:")
+        #     print(f"      K available: {K}")
+        #     print(f"      Candidates: {num_candidates}")
+        #     if num_candidates > 0:
+        #         print(f"      Candidate scores: min={candidate_scores.min():.3f}, max={candidate_scores.max():.3f}, mean={candidate_scores.mean():.3f}")
+        #     print(f"      No-op score: {noop_score:.3f}")
 
-        for house_id in sorted_candidates:
-            if remaining_K <= 0:
-                break
+        if num_candidates == 0 or (num_candidates > 0 and noop_score >= float(candidate_scores.max())):
+            return None, True
 
-            cmax = int(self._arr_cmax[house_id])
-            remain = int(self._arr_rem[house_id])
-            give = min(cmax, remain, remaining_K)
-
-            if give > 0:
-                allocation[house_id] = give
-                remaining_K -= give
-            # ===== 新增：Debug result =====
-        if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
-            print(f"      Result: {len(allocation)} houses allocated, {sum(allocation.values())} total workers")
-            if remaining_K > 0:
-                print(f"      ⚠️  {remaining_K} workers unused!")
-        return allocation
+        idx = int(np.argmax(candidate_scores))
+        return candidates[idx], False
 
 
 class BaselineEnv(BaseEnv):
@@ -1003,7 +1075,7 @@ class BaselineEnv(BaseEnv):
         M_min: int = 512,
         M_max: int = 2048,
         use_batch_arrival: bool = True,
-        use_capacity_ramp: bool = True,
+        use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
         observation_noise: float = 0.15,
         capacity_noise: float = 0.10,
@@ -1042,59 +1114,22 @@ class BaselineEnv(BaseEnv):
         """Baseline doesn't use action input."""
         return super().step(action=None)
 
-    def _allocate_from_candidates(
-        self,
-        candidates: List[int],
-        action: Any,
-        K: int
-    ) -> Dict[int, int]:
-        """
-        Allocate using fixed priority rule.
+    def _baseline_pick_next(self) -> Tuple[Optional[int], bool]:
+        if len(self.pending_candidates) == 0 or self.capacity_remaining <= 0:
+            return None, True
 
-        Args:
-            candidates: Selected M candidates
-            action: Not used
-            K: Available capacity
+        candidates = self.pending_candidates
 
-        Returns:
-            Allocation dictionary
-        """
         if self.policy == "LJF":
-            # Longest Job First: Sort by total work (descending)
-            sorted_candidates = sorted(
-                candidates,
-                key=lambda h: -self._arr_total[h]
-            )
-
+            selected = max(candidates, key=lambda h: self._arr_total[h])
         elif self.policy == "SJF":
-            # Shortest Job First: Sort by total work (ascending)
-            sorted_candidates = sorted(
-                candidates,
-                key=lambda h: self._arr_total[h]
-            )
-
+            selected = min(candidates, key=lambda h: self._arr_total[h])
         elif self.policy == "Random":
-            # Random order
-            sorted_candidates = candidates.copy()
-            self.rng.shuffle(sorted_candidates)
+            selected = int(self.rng.choice(candidates))
+        else:
+            selected = int(self.rng.choice(candidates))
 
-        # Greedy allocation
-        allocation = {}
-        remaining_K = K
-
-        for house_id in sorted_candidates:
-            if remaining_K <= 0:
-                break
-
-            cmax = int(self._arr_cmax[house_id])
-            remain = int(self._arr_rem[house_id])
-            give = min(cmax, remain, remaining_K)
-
-            if give > 0:
-                allocation[house_id] = give
-                remaining_K -= give
-
-        return allocation
+        return selected, False
 
 
 class OracleEnv(BaseEnv):
@@ -1112,7 +1147,7 @@ class OracleEnv(BaseEnv):
         M_min: int = 512,
         M_max: int = 2048,
         use_batch_arrival: bool = True,
-        use_capacity_ramp: bool = True,
+        use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
         observation_noise: float = 0.15,
         capacity_noise: float = 0.10,
@@ -1151,49 +1186,16 @@ class OracleEnv(BaseEnv):
         """Oracle sees entire queue (no M limit)."""
         return queue_ids
 
-    def _allocate_from_candidates(
-        self,
-        candidates: List[int],
-        action: Any,
-        K: int
-    ) -> Dict[int, int]:
-        """
-        Allocate using policy on entire queue.
+    def _baseline_pick_next(self) -> Tuple[Optional[int], bool]:
+        if len(self.pending_candidates) == 0 or self.capacity_remaining <= 0:
+            return None, True
 
-        Args:
-            candidates: All houses in queue
-            action: Not used
-            K: Available capacity
-
-        Returns:
-            Allocation dictionary
-        """
         if self.policy == "LJF":
-            sorted_all = sorted(candidates, key=lambda h: -self._arr_total[h])
-        elif self.policy == "SJF":
-            sorted_all = sorted(candidates, key=lambda h: self._arr_total[h])
+            selected = max(self.pending_candidates, key=lambda h: self._arr_total[h])
         else:
-            sorted_all = candidates
+            selected = min(self.pending_candidates, key=lambda h: self._arr_total[h])
 
-        # Greedy allocation
-        allocation = {}
-        remaining_K = K
-
-        for h in sorted_all:
-            if remaining_K <= 0:
-                break
-
-            give = min(
-                self._arr_cmax[h],
-                self._arr_rem[h],
-                remaining_K
-            )
-
-            if give > 0:
-                allocation[h] = give
-                remaining_K -= give
-
-        return allocation
+        return selected, False
 
 
 # ============================================================================
@@ -1230,8 +1232,10 @@ class HousegymRLENV(RLEnv):
 
     def last_candidate_view(self):
         """Legacy method for getting candidate info."""
-        queue_ids = self.waiting_queue.get_all()
-        candidates = self._select_candidates(queue_ids) if queue_ids else []
+        candidates = self.pending_candidates
+        if not candidates:
+            queue_ids = self.waiting_queue.get_all()
+            candidates = self._select_candidates(queue_ids) if queue_ids else []
 
         remain = np.zeros(self.M_max, dtype=np.float32)
         mask = np.zeros(self.M_max, dtype=np.float32)
