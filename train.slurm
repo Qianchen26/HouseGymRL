@@ -33,19 +33,20 @@ BASE_DIR="/home/yu.qianchen/ondemand/housegymrl"
 LOG_DIR="${BASE_DIR}/artifacts/logs"
 mkdir -p "${LOG_DIR}" "${BASE_DIR}/results" "${BASE_DIR}/runs" "${BASE_DIR}/artifacts/models"
 
-cd "${BASE_DIR}"
-export PYTHONPATH="${BASE_DIR}/src:${PYTHONPATH:-}"
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-DATASET_PATH="results/synthetic_training_dataset.csv"
+# Change to src directory to run scripts (avoids PYTHONPATH issues)
+cd "${BASE_DIR}/src"
+
+DATASET_PATH="../results/synthetic_training_dataset.csv"
 if [ ! -f "$DATASET_PATH" ]; then
     echo "Dataset not found; generating synthetic scenarios..."
-    python -m synthetic_scenarios --seed 42 --output "$DATASET_PATH"
+    python synthetic_scenarios.py --seed 42 --output "$DATASET_PATH"
 fi
 
-echo "Running training pipeline (src/main.py)"
-python -m main
+echo "Running training pipeline (main.py)"
+python main.py
 
 EXIT_CODE=$?
 
