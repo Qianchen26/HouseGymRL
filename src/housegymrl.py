@@ -678,8 +678,7 @@ class BaseEnv(gym.Env):
         # Fraction of available workers actually used
         capacity_usage = 0.0
         if self.last_workers_available > 0:
-            used_workers = self.last_workers_available - self.workers_available
-            capacity_usage = used_workers / self.last_workers_available
+            capacity_usage = self.last_workers_used / self.last_workers_available
 
         # Weighted combination (before scaling)
         raw_reward = (
