@@ -36,8 +36,27 @@ mkdir -p "${LOG_DIR}" "${BASE_DIR}/results" "${BASE_DIR}/runs" "${BASE_DIR}/arti
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
+# Ensure PYTHONPATH is clean (avoid numpy import conflicts)
+unset PYTHONPATH
+
 # Change to src directory to run scripts (avoids PYTHONPATH issues)
 cd "${BASE_DIR}/src"
+
+# Diagnostic: Test numpy import before running training
+echo ""
+echo "Environment Diagnostics:"
+echo "  Python: $(which python)"
+echo "  Working directory: $(pwd)"
+python -c "import sys; print(f'  Python path: {sys.path[0]}')"
+echo "  Testing numpy import..."
+python -c "import numpy; print(f'  ✅ NumPy {numpy.__version__} loaded successfully')" || {
+    echo "  ❌ NumPy import failed!"
+    echo "  Attempting to fix numpy installation..."
+    pip uninstall -y numpy
+    pip install --no-cache-dir numpy==2.0.2
+    python -c "import numpy; print(f'  ✅ NumPy {numpy.__version__} reinstalled')"
+}
+echo ""
 
 DATASET_PATH="../results/synthetic_training_dataset.csv"
 if [ ! -f "$DATASET_PATH" ]; then

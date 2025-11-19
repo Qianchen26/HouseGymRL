@@ -33,8 +33,21 @@ BASE_DIR="/home/yu.qianchen/ondemand/housegymrl"
 LOG_DIR="${BASE_DIR}/artifacts/logs"
 mkdir -p "${LOG_DIR}" "${BASE_DIR}/results" "${BASE_DIR}/runs" "${BASE_DIR}/artifacts/results"
 
+# Ensure PYTHONPATH is clean (avoid numpy import conflicts)
+unset PYTHONPATH
+
 # Change to src directory to run scripts (avoids PYTHONPATH issues)
 cd "${BASE_DIR}/src"
+
+# Diagnostic: Test numpy import
+echo ""
+echo "Environment Diagnostics:"
+echo "  Python: $(which python)"
+python -c "import numpy; print(f'  ✅ NumPy {numpy.__version__} loaded')" || {
+    echo "  ❌ NumPy import failed - reinstalling..."
+    pip uninstall -y numpy && pip install --no-cache-dir numpy==2.0.2
+}
+echo ""
 
 DATASET_PATH="../results/synthetic_training_dataset.csv"
 if [ ! -f "$DATASET_PATH" ]; then
