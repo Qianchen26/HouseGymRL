@@ -42,12 +42,12 @@ print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 # Cell 1.2: Create Output Directories
 output_dirs = [
-    "results",
-    "results/figures",
-    "results/rmse",
-    "models",
-    "runs",
-    "runs/sac_diverse",
+    "../results",
+    "../results/figures",
+    "../results/rmse",
+    "../models",
+    "../runs",
+    "../runs/sac_diverse",
 ]
 
 for dir_path in output_dirs:
@@ -621,7 +621,7 @@ print("VERIFICATION 10: TRAINING DATA")
 print("="*70)
 
 # Load synthetic training dataset
-training_df = pd.read_csv('results/synthetic_training_dataset.csv')
+training_df = pd.read_csv('../results/synthetic_training_dataset.csv')
 
 print(f"\nTraining Dataset Summary:")
 print(f"  Total regions: {len(training_df)}")
@@ -659,7 +659,7 @@ print("LOADING TRAINING DATA")
 print("="*70)
 
 # Load synthetic training dataset
-training_df = pd.read_csv('results/synthetic_training_dataset.csv')
+training_df = pd.read_csv('../results/synthetic_training_dataset.csv')
 print(f"✅ Loaded {len(training_df)} training regions")
 
 # Register all synthetic regions
@@ -697,7 +697,7 @@ def make_diverse_training_env(rank: int, seed: int):
     Each episode uses a different random region.
     """
     # Load training dataset
-    df = pd.read_csv('results/synthetic_training_dataset.csv')
+    df = pd.read_csv('../results/synthetic_training_dataset.csv')
     region_keys = df['region_key'].tolist()
     
     def _init():
@@ -824,7 +824,7 @@ print("="*70)
 print("CREATING SAC MODEL")
 print("="*70)
 
-tensorboard_log_dir = "./runs/sac_diverse/"
+tensorboard_log_dir = "../runs/sac_diverse/"
 model = SAC(
     "MlpPolicy",
     vec_env,
@@ -896,7 +896,7 @@ training_logger = TrainingLoggerCallback(log_freq=5000, verbose=1)  # Log every 
 
 checkpoint_callback = CheckpointCallback(
     save_freq=50_000 // N_ENVS,  # Adjust for parallel envs
-    save_path='./models/checkpoints/',
+    save_path='../models/checkpoints/',
     name_prefix='sac_diverse',
     verbose=1
 )
@@ -984,18 +984,18 @@ print("SAVING TRAINED MODEL")
 print("="*70)
 
 # Save model
-model.save("models/sac_diverse_final")
-print("✅ Model saved: models/sac_diverse_final.zip")
+model.save("../models/sac_diverse_final")
+print("✅ Model saved: ../models/sac_diverse_final.zip")
 
 # Save VecNormalize statistics
-vec_env.save("models/sac_diverse_vecnorm.pkl")
-print("✅ VecNormalize stats saved: models/sac_diverse_vecnorm.pkl")
+vec_env.save("../models/sac_diverse_vecnorm.pkl")
+print("✅ VecNormalize stats saved: ../models/sac_diverse_vecnorm.pkl")
 
 print("\n✅ All training artifacts saved successfully!")
 print("\nSaved files:")
-print("  - models/sac_diverse_final.zip")
-print("  - models/sac_diverse_vecnorm.pkl")
-print("  - models/checkpoints/sac_diverse_*.zip")
+print("  - ../models/sac_diverse_final.zip")
+print("  - ../models/sac_diverse_vecnorm.pkl")
+print("  - ../models/checkpoints/sac_diverse_*.zip")
 
 
 # Skip cross-scenario evaluation temporarily
@@ -1015,7 +1015,7 @@ print("LOADING TRAINED MODEL")
 print("="*70)
 
 # Load SAC model
-sac_model = SAC.load("models/sac_diverse_final")
+sac_model = SAC.load("../models/sac_diverse_final")
 print("✅ SAC model loaded")
 
 # Note: VecNormalize stats not needed for evaluation since we evaluate on raw environment
@@ -1140,8 +1140,8 @@ results_df = pd.DataFrame([
 ])
 
 # Save results
-results_df.to_csv('results/cross_scenario_results.csv', index=False)
-print(f"\n✅ Evaluation complete! Results saved to: results/cross_scenario_results.csv")
+results_df.to_csv('../results/cross_scenario_results.csv', index=False)
+print(f"\n✅ Evaluation complete! Results saved to: ../results/cross_scenario_results.csv")
 
 # Quick summary
 print(f"\n{'='*70}")
@@ -1163,7 +1163,7 @@ print("="*70)
 print("DETAILED SUMMARY STATISTICS")
 print("="*70)
 
-results_df = pd.read_csv('results/cross_scenario_results.csv')
+results_df = pd.read_csv('../results/cross_scenario_results.csv')
 
 print(f"\nOverall Performance by Policy:")
 summary = results_df.groupby('policy')['final_completion'].agg([
@@ -1216,8 +1216,8 @@ plt.title('Performance Heatmap: Policy × Crew Availability', fontsize=14, pad=2
 plt.xlabel('Crew Availability', fontsize=12)
 plt.ylabel('Policy', fontsize=12)
 plt.tight_layout()
-plt.savefig('results/figures/heatmap_policy_crew.png', dpi=150, bbox_inches='tight')
-print("✅ Saved: results/figures/heatmap_policy_crew.png")
+plt.savefig('../results/figures/heatmap_policy_crew.png', dpi=150, bbox_inches='tight')
+print("✅ Saved: ../results/figures/heatmap_policy_crew.png")
 plt.show()
 
 
@@ -1261,8 +1261,8 @@ for ax, region in zip(axes, results_df['region'].unique()):
     ax.set_ylim(0, 1.05)
 
 plt.tight_layout()
-plt.savefig('results/figures/crew_sensitivity.png', dpi=150, bbox_inches='tight')
-print("✅ Saved: results/figures/crew_sensitivity.png")
+plt.savefig('../results/figures/crew_sensitivity.png', dpi=150, bbox_inches='tight')
+print("✅ Saved: ../results/figures/crew_sensitivity.png")
 plt.show()
 
 
@@ -1283,8 +1283,8 @@ plt.ylabel('Completion Rate', fontsize=12)
 plt.ylim(0, 1.05)
 plt.grid(True, alpha=0.3, axis='y')
 plt.tight_layout()
-plt.savefig('results/figures/robustness_boxplot.png', dpi=150, bbox_inches='tight')
-print("✅ Saved: results/figures/robustness_boxplot.png")
+plt.savefig('../results/figures/robustness_boxplot.png', dpi=150, bbox_inches='tight')
+print("✅ Saved: ../results/figures/robustness_boxplot.png")
 plt.show()
 
 
@@ -1364,10 +1364,10 @@ report.append(f"- Most robust (lowest CV): {most_robust}\n")
 report.append(f"- Total scenarios tested: {len(results_df)}\n")
 
 # Save report
-with open('results/evaluation_report.md', 'w') as f:
+with open('../results/evaluation_report.md', 'w') as f:
     f.writelines(report)
 
-print("\n✅ Report saved: results/evaluation_report.md")
+print("\n✅ Report saved: ../results/evaluation_report.md")
 
 # Print report
 print("\n" + "="*70)
@@ -1377,10 +1377,10 @@ print("\n" + "="*70)
 
 print("\n✅ ALL TASKS COMPLETED SUCCESSFULLY!")
 print("\nGenerated outputs:")
-print("  - models/sac_diverse_final.zip")
-print("  - results/cross_scenario_results.csv")
-print("  - results/figures/heatmap_policy_crew.png")
-print("  - results/figures/crew_sensitivity.png")
-print("  - results/figures/robustness_boxplot.png")
-print("  - results/evaluation_report.md")
+print("  - ../models/sac_diverse_final.zip")
+print("  - ../results/cross_scenario_results.csv")
+print("  - ../results/figures/heatmap_policy_crew.png")
+print("  - ../results/figures/crew_sensitivity.png")
+print("  - ../results/figures/robustness_boxplot.png")
+print("  - ../results/evaluation_report.md")
 '''

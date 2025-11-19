@@ -188,7 +188,7 @@ def register_dataframe(df: pd.DataFrame) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate structured synthetic scenarios")
-    parser.add_argument("--output", type=Path, default=Path("results/synthetic_training_dataset.csv"),
+    parser.add_argument("--output", type=Path, default=Path("../results/synthetic_training_dataset.csv"),
                         help="CSV path to write the generated scenarios")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--normal", type=int, default=50, help="Normal samples per template")
