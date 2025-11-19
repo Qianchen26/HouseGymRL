@@ -41,11 +41,11 @@ export MKL_NUM_THREADS=$SLURM_CPUS_PER_TASK
 DATASET_PATH="results/synthetic_training_dataset.csv"
 if [ ! -f "$DATASET_PATH" ]; then
     echo "Dataset not found; generating synthetic scenarios..."
-    python src/synthetic_scenarios.py --seed 42 --output "$DATASET_PATH"
+    python -m synthetic_scenarios --seed 42 --output "$DATASET_PATH"
 fi
 
 echo "Running training pipeline (src/main.py)"
-python src/main.py
+python -m main
 
 EXIT_CODE=$?
 

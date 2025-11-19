@@ -39,11 +39,11 @@ export PYTHONPATH="${BASE_DIR}/src:${PYTHONPATH:-}"
 DATASET_PATH="results/synthetic_training_dataset.csv"
 if [ ! -f "$DATASET_PATH" ]; then
     echo "Dataset not found; generating synthetic scenarios for evaluation context..."
-    python src/synthetic_scenarios.py --seed 42 --output "$DATASET_PATH"
+    python -m synthetic_scenarios --seed 42 --output "$DATASET_PATH"
 fi
 
 echo "Running evaluation pipeline (src/evaluate.py)"
-python src/evaluate.py
+python -m evaluate
 
 EXIT_CODE=$?
 
