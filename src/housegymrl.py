@@ -24,7 +24,7 @@ try:
 except ImportError:
     import gym
     from gym import spaces
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Any
 import warnings
 from pathlib import Path
 import pickle
@@ -377,12 +377,10 @@ class BaseEnv(gym.Env):
         self.last_workers_used = 0
         self.last_workers_available = 0
 
-        # Intra-day tracking state
+        # Daily decision state
         self.pending_candidates: List[int] = []
         self.pending_allocation: Dict[int, int] = {}
-        self.capacity_remaining: int = 0
         self.current_day_capacity: int = 0
-        self.step_in_day: int = 0
         self.current_day_initial_candidates: int = 0
 
         # Define spaces
@@ -499,7 +497,8 @@ class BaseEnv(gym.Env):
 
     def _begin_day_if_needed(self) -> None:
         """Initialize per-day state if we are starting a new day."""
-        if not (self.capacity_remaining <= 0 and self.step_in_day == 0 and not self.pending_allocation):
+        # Only initialize if we don't already have candidates for today
+        if self.pending_candidates:
             return
 
         # Reveal new houses for this day
@@ -509,12 +508,10 @@ class BaseEnv(gym.Env):
 
         # Sample capacity for the day
         capacity = self._get_capacity_for_day(self.day)
-        self.capacity_remaining = capacity
         self.current_day_capacity = capacity
-        self.current_day_initial_candidates = 0
         self.pending_allocation = {}
         self.pending_candidates = []
-        self.step_in_day = 0
+        self.current_day_initial_candidates = 0
 
         # No tasks or no capacity → nothing to do until advance
         if capacity <= 0 or self.waiting_queue.size() == 0:
@@ -531,22 +528,17 @@ class BaseEnv(gym.Env):
         allocation = dict(self.pending_allocation)
         obs, reward, terminated, truncated, info = self._execute_allocation(allocation)
 
-        # Reset intra-day state
+        # Reset day state (for next step)
         self.pending_candidates = []
         self.pending_allocation = {}
-        self.capacity_remaining = 0
         self.current_day_capacity = 0
         self.current_day_initial_candidates = 0
-        self.step_in_day = 0
-
-        info["day_advanced"] = True
-        info["step_in_day"] = 0
 
         if not terminated and not truncated:
+            # Prepare next day's candidates and observation
             self._begin_day_if_needed()
             obs = self._get_obs()
 
-        info["action_mask"] = self._build_action_mask()
         return obs, reward, terminated, truncated, info
 
     @property
@@ -705,66 +697,44 @@ class BaseEnv(gym.Env):
         return selected.tolist()
 
     def step(self, action):
-        """Execute one intra-day decision (choose next house or end the day)."""
+        """
+        Execute one daily batch decision.
+
+        Each step processes an entire day:
+        1. Begin new day (reveal new houses, sample candidates)
+        2. Get allocation from policy (RL or baseline)
+        3. Execute allocation and advance to next day
+        4. Return observation and reward
+
+        Args:
+            action: Action from policy (or None for baseline)
+
+        Returns:
+            observation, reward, terminated, truncated, info
+        """
         # Initialize a new day if needed
         self._begin_day_if_needed()
 
-        # Nothing to do → advance day immediately
-        if self.capacity_remaining <= 0 or self.waiting_queue.size() == 0 or len(self.pending_candidates) == 0:
-            return self._advance_day()
-
-        # Determine selection source (RL vs. baseline)
-        if action is None:
-            chosen_house_id, is_noop = self._baseline_pick_next()
+        # Get allocation for today
+        if self.waiting_queue.size() == 0 or len(self.pending_candidates) == 0 or self.current_day_capacity <= 0:
+            # No houses to work on or no capacity → empty allocation
+            allocation = {}
+        elif action is None:
+            # Baseline policy
+            allocation = self._baseline_allocate()
         else:
+            # RL policy
             candidates_view = self.pending_candidates[:self.M_max]
-            chosen_house_id, is_noop = self._allocate_from_candidates(
+            allocation = self._allocate_from_candidates(
                 candidates_view,
                 action,
-                self.capacity_remaining,
+                self.current_day_capacity,
             )
 
-        # If policy decides to end the day (or nothing to choose)
-        if is_noop or chosen_house_id is None:
-            return self._advance_day()
+        # Store allocation and advance day
+        self.pending_allocation = allocation
+        obs, reward, terminated, truncated, info = self._advance_day()
 
-        # Allocate as many workers as possible to the selected house
-        cmax = int(np.ceil(self._arr_cmax[chosen_house_id]))
-        remain = int(np.ceil(self._arr_rem[chosen_house_id]))
-        give = min(cmax, remain, self.capacity_remaining)
-
-        if give > 0:
-            self.pending_allocation[chosen_house_id] = (
-                self.pending_allocation.get(chosen_house_id, 0) + give
-            )
-            self.capacity_remaining -= give
-
-        # Remove the house from today's candidate set
-        if chosen_house_id in self.pending_candidates:
-            self.pending_candidates.remove(chosen_house_id)
-
-        # End of day conditions
-        if self.capacity_remaining <= 0 or len(self.pending_candidates) == 0:
-            return self._advance_day()
-
-        # Otherwise remain in the same day (reward=0)
-        self.step_in_day += 1
-        obs = self._get_obs()
-        reward = 0.0
-        terminated = False
-        truncated = False
-        info = {
-            "day": self.day,
-            "day_advanced": False,
-            "step_in_day": self.step_in_day,
-            "K_remaining": self.capacity_remaining,
-            "queue_size": self.waiting_queue.size(),
-            "completion": self.last_completion,
-            "M": len(self.pending_candidates),
-            "decision_day": self.day,
-            "revealed_count": self.arrival_system.get_revealed_count(),
-            "action_mask": self._build_action_mask(),
-        }
         return obs, reward, terminated, truncated, info
 
     def _allocate_from_candidates(
@@ -787,9 +757,14 @@ class BaseEnv(gym.Env):
         """
         raise NotImplementedError("Subclass must implement _allocate_from_candidates")
 
-    def _baseline_pick_next(self) -> Tuple[Optional[int], bool]:
-        """Baseline policies override this to pick a house or end the day."""
-        raise NotImplementedError("Baseline environments must implement _baseline_pick_next")
+    def _baseline_allocate(self) -> Dict[int, int]:
+        """
+        Baseline policies override this to allocate workers for the day.
+
+        Returns:
+            Dictionary mapping house_id to number of workers
+        """
+        raise NotImplementedError("Baseline environments must implement _baseline_allocate")
 
     def _execute_allocation(self, allocation: Dict[int, int]):
         """
@@ -910,7 +885,7 @@ class BaseEnv(gym.Env):
 
         global_features = np.array([
             self.day / max(1.0, self.max_steps),
-            float(self.capacity_remaining),
+            float(self.current_day_capacity),
             float(self.waiting_queue.size()),
             float(len(revealed_ids)),
             remain_ratio,
@@ -981,11 +956,8 @@ class BaseEnv(gym.Env):
         self.last_workers_available = 0
         self.pending_candidates = []
         self.pending_allocation = {}
-        self.capacity_remaining = 0
         self.current_day_capacity = 0
-        self.step_in_day = 0
         self.current_day_initial_candidates = 0
-
 
         # Initial batch arrival
         initial_arrivals = self.arrival_system.step_to_day(0)
@@ -1007,9 +979,12 @@ class BaseEnv(gym.Env):
         obs = self._get_obs()
         info = {
             "day": 0,
-            "day_advanced": False,
-            "step_in_day": 0,
-            "action_mask": self._build_action_mask(),
+            "completed_days": 0,
+            "decision_day": 0,
+            "completion": 0.0,
+            "queue_size": self.waiting_queue.size(),
+            "revealed_count": self.arrival_system.get_revealed_count(),
+            "M": len(self.pending_candidates),
         }
 
         return obs, info
@@ -1030,34 +1005,103 @@ class RLEnv(BaseEnv):
         candidates: List[int],
         action: np.ndarray,
         K: int
-    ) -> Tuple[Optional[int], bool]:
+    ) -> Dict[int, int]:
         """
-        Pick a single candidate (or no-op) based on action scores.
+        Hybrid weighted allocation: Softmax-based but cmax-aware.
+
+        Algorithm:
+        1. Use softmax to get "ideal allocation" based on priorities
+        2. Clip by cmax constraints
+        3. Redistribute capacity limited by cmax
+        4. Round to integers preserving total capacity
+
+        Args:
+            candidates: List of house IDs available for allocation
+            action: Action vector with priority scores
+            K: Total available capacity (contractors)
 
         Returns:
-            (house_id, is_noop)
+            Dictionary mapping house_id → num_contractors
         """
-        num_candidates = len(candidates)
-        if num_candidates == 0 or K <= 0:
-            return None, True
+        M = len(candidates)
 
-        candidate_scores = action[:num_candidates]
-        noop_index = self.M_max if self.M_max < len(action) else len(action) - 1
-        noop_score = float(action[noop_index])
+        # Edge case: no candidates or no capacity
+        if M == 0 or K <= 0:
+            return {}
 
-        # if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
-        #     print(f"    [RL ALLOC DEBUG] Day {self.day}:")
-        #     print(f"      K available: {K}")
-        #     print(f"      Candidates: {num_candidates}")
-        #     if num_candidates > 0:
-        #         print(f"      Candidate scores: min={candidate_scores.min():.3f}, max={candidate_scores.max():.3f}, mean={candidate_scores.mean():.3f}")
-        #     print(f"      No-op score: {noop_score:.3f}")
+        # Extract priority scores for actual candidates
+        priorities = action[:M].astype(np.float64)
 
-        if num_candidates == 0 or (num_candidates > 0 and noop_score >= float(candidate_scores.max())):
-            return None, True
+        # Get cmax for each candidate
+        cmax_array = np.array([
+            self._arr_cmax[candidates[i]]
+            for i in range(M)
+        ], dtype=np.float64)
 
-        idx = int(np.argmax(candidate_scores))
-        return candidates[idx], False
+        # Step 1: Softmax allocation (ideal distribution)
+        # Subtract max for numerical stability
+        exp_p = np.exp(priorities - np.max(priorities))
+        probs = exp_p / (exp_p.sum() + 1e-10)  # Add epsilon to prevent division by zero
+        ideal_allocation = probs * K
+
+        # Step 2: Clip by cmax constraints
+        allocation = np.minimum(ideal_allocation, cmax_array)
+
+        # Step 3: Redistribute leftover capacity
+        used = allocation.sum()
+        leftover = K - used
+
+        if leftover > 1e-6:  # If there's significant leftover capacity
+            # Find houses that can accept more contractors
+            can_take_more = cmax_array - allocation
+            can_take_more = np.maximum(can_take_more, 0)
+
+            if can_take_more.sum() > 1e-6:
+                # Redistribute proportionally based on original priorities
+                # but only to houses that can accept more
+                eligible_mask = can_take_more > 1e-6
+                eligible_probs = probs * eligible_mask
+
+                if eligible_probs.sum() > 1e-6:
+                    eligible_probs = eligible_probs / eligible_probs.sum()
+                    extra_allocation = eligible_probs * leftover
+                    extra_allocation = np.minimum(extra_allocation, can_take_more)
+                    allocation += extra_allocation
+
+        # Step 4: Convert to integers while preserving total capacity
+        int_allocation = np.floor(allocation).astype(int)
+        remaining = int(K - int_allocation.sum())
+
+        if remaining > 0:
+            # Distribute remaining contractors based on fractional parts
+            fractional = allocation - int_allocation
+
+            # Only give to houses that haven't hit their cmax
+            can_accept = (int_allocation < cmax_array)
+            fractional[~can_accept] = -1  # Mark ineligible
+
+            # Give to houses with largest fractional parts
+            if np.any(can_accept):
+                top_indices = np.argsort(-fractional)[:remaining]
+                # Double-check they can actually accept
+                for idx in top_indices:
+                    if int_allocation[idx] < cmax_array[idx]:
+                        int_allocation[idx] += 1
+
+        # Step 5: Build result dictionary (only include houses with allocation > 0)
+        result = {}
+        for i in range(M):
+            if int_allocation[i] > 0:
+                result[candidates[i]] = int(int_allocation[i])
+
+        # Validation assertions (can be removed in production)
+        total_allocated = sum(result.values())
+        assert total_allocated <= K, f"Over-allocated: {total_allocated} > {K}"
+        for house_id, num in result.items():
+            assert num <= self._arr_cmax[house_id], \
+                f"House {house_id} allocated {num} > cmax {self._arr_cmax[house_id]}"
+
+        return result
 
 
 class BaselineEnv(BaseEnv):
@@ -1114,22 +1158,52 @@ class BaselineEnv(BaseEnv):
         """Baseline doesn't use action input."""
         return super().step(action=None)
 
-    def _baseline_pick_next(self) -> Tuple[Optional[int], bool]:
-        if len(self.pending_candidates) == 0 or self.capacity_remaining <= 0:
-            return None, True
+    def _baseline_allocate(self) -> Dict[int, int]:
+        """
+        Greedy allocation based on policy priority.
 
-        candidates = self.pending_candidates
+        Allocates contractors greedily:
+        1. Sort candidates by policy (LJF/SJF/Random)
+        2. Greedily allocate respecting cmax constraints
+        3. Continue until capacity exhausted
 
+        Returns:
+            Dictionary mapping house_id to number of contractors
+        """
+        if len(self.pending_candidates) == 0 or self.current_day_capacity <= 0:
+            return {}
+
+        candidates = self.pending_candidates.copy()
+
+        # Sort by policy
         if self.policy == "LJF":
-            selected = max(candidates, key=lambda h: self._arr_total[h])
+            # Longest Job First: prioritize houses with most total work
+            candidates.sort(key=lambda h: self._arr_total[h], reverse=True)
         elif self.policy == "SJF":
-            selected = min(candidates, key=lambda h: self._arr_total[h])
+            # Shortest Job First: prioritize houses with least total work
+            candidates.sort(key=lambda h: self._arr_total[h])
         elif self.policy == "Random":
-            selected = int(self.rng.choice(candidates))
-        else:
-            selected = int(self.rng.choice(candidates))
+            # Random: shuffle candidates
+            self.rng.shuffle(candidates)
 
-        return selected, False
+        # Greedy allocation
+        allocation = {}
+        remaining_capacity = self.current_day_capacity
+
+        for house_id in candidates:
+            if remaining_capacity <= 0:
+                break
+
+            # How many contractors can we give to this house?
+            cmax = int(np.ceil(self._arr_cmax[house_id]))
+            remaining_work = int(np.ceil(self._arr_rem[house_id]))
+            give = min(cmax, remaining_work, remaining_capacity)
+
+            if give > 0:
+                allocation[house_id] = give
+                remaining_capacity -= give
+
+        return allocation
 
 
 class OracleEnv(BaseEnv):
@@ -1186,16 +1260,43 @@ class OracleEnv(BaseEnv):
         """Oracle sees entire queue (no M limit)."""
         return queue_ids
 
-    def _baseline_pick_next(self) -> Tuple[Optional[int], bool]:
-        if len(self.pending_candidates) == 0 or self.capacity_remaining <= 0:
-            return None, True
+    def _baseline_allocate(self) -> Dict[int, int]:
+        """
+        Oracle greedy allocation with full queue visibility.
 
+        Same as BaselineEnv but sees entire queue (no M limit).
+
+        Returns:
+            Dictionary mapping house_id to number of contractors
+        """
+        if len(self.pending_candidates) == 0 or self.current_day_capacity <= 0:
+            return {}
+
+        candidates = self.pending_candidates.copy()
+
+        # Sort by policy
         if self.policy == "LJF":
-            selected = max(self.pending_candidates, key=lambda h: self._arr_total[h])
-        else:
-            selected = min(self.pending_candidates, key=lambda h: self._arr_total[h])
+            candidates.sort(key=lambda h: self._arr_total[h], reverse=True)
+        else:  # SJF
+            candidates.sort(key=lambda h: self._arr_total[h])
 
-        return selected, False
+        # Greedy allocation
+        allocation = {}
+        remaining_capacity = self.current_day_capacity
+
+        for house_id in candidates:
+            if remaining_capacity <= 0:
+                break
+
+            cmax = int(np.ceil(self._arr_cmax[house_id]))
+            remaining_work = int(np.ceil(self._arr_rem[house_id]))
+            give = min(cmax, remaining_work, remaining_capacity)
+
+            if give > 0:
+                allocation[house_id] = give
+                remaining_capacity -= give
+
+        return allocation
 
 
 # ============================================================================

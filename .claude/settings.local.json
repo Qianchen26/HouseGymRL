@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$(cat <<''EOF''\nBackup: Pre-daily-batch-redesign state\n\nCurrent implementation uses intra-day decisions (one step per house allocation).\n- Episode length: ~1.8M steps\n- Infeasible for RL training\n- TensorBoard shows train metrics but no episode metrics\n\nNext: Redesign to daily batch decisions (500 steps/episode)\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n\nCo-Authored-By: Claude <noreply@anthropic.com>\nEOF\n)\")",
+      "Bash(git checkout:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
