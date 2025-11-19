@@ -5,7 +5,7 @@ Use the steps below whenever you want to inspect training logs stored in
 
 ## 1. Open SSH tunnel from local machine
 ```bash
-ssh -L 1126:localhost:1126 yu.qianchen@hpg.rc.ufl.edu
+
 ```
 - Replace the username if needed.
 - Keep this terminal open; it forwards local port `1126` to the cluster.
@@ -15,7 +15,7 @@ In the same SSH session (after the prompt changes to `loginXX`):
 ```bash
 module load conda
 conda activate urbanai
-tensorboard --logdir /home/yu.qianchen/ondemand/housegymrl/runs --port 1126
+tensorboard --logdir /home/yu.qianchen/ondemand/housegymrl/runs/sac_diverse --port 1126
 
 ```
 Leave TensorBoard running; it will report something like `http://localhost:1126/`.
@@ -39,7 +39,7 @@ training metrics.
 tail -f artifacts/logs/train_<JOBID>.out
 tail -f artifacts/logs/train_<JOBID>.err
 
-tail -f artifacts/logs/train_18635201.out
+
 
 查找是否开始训练：
 rg -n "STARTING SAC TRAINING" artifacts/logs/train_<JOBID>.out

@@ -928,7 +928,8 @@ print("="*70)
 #
 # For production research: Recommend 32M-64M steps for robust learning curves
 # For quick testing: 5M-10M steps just to verify code works
-TOTAL_TIMESTEPS = 5_000_000  # Current: Testing configuration
+# For rapid iteration: 500k steps to validate reward function changes
+TOTAL_TIMESTEPS = 500_000  # Current: Quick validation for reward optimization
 
 print(f"\nTraining Configuration:")
 print(f"  Total timesteps: {TOTAL_TIMESTEPS:,}")
