@@ -867,28 +867,41 @@ print("="*70)
 # Reward component logger for TensorBoard
 class RewardComponentLogger(BaseCallback):
     """
-    Logs individual reward components to TensorBoard for analysis.
-    Components: progress, completion, queue_penalty, capacity_usage.
+    Logs reward components and monitoring metrics to TensorBoard.
+
+    Reward components (V2.1):
+    - progress: Houses completed this step
+    - completion: Cumulative completion fraction
+    - queue_penalty: Sigmoid penalty (capped at -5.0)
+
+    Monitoring metrics (not in reward):
+    - capacity_usage: Resource utilization (always ~1.0 by design)
     """
     def __init__(self, verbose=0):
         super().__init__(verbose)
 
     def _on_step(self) -> bool:
+        # Check if logger is available
+        if self.logger is None:
+            return True
+
         # Check if we have info from the latest step
         if len(self.locals.get("infos", [])) > 0:
             info = self.locals["infos"][0]
 
-            # Log reward components if they exist
+            # Log reward components
             if "reward_progress" in info:
                 self.logger.record("reward/progress", info["reward_progress"])
             if "reward_completion" in info:
                 self.logger.record("reward/completion", info["reward_completion"])
             if "reward_queue_penalty" in info:
                 self.logger.record("reward/queue_penalty", info["reward_queue_penalty"])
-            if "reward_capacity_usage" in info:
-                self.logger.record("reward/capacity_usage", info["reward_capacity_usage"])
             if "reward_raw_total" in info:
                 self.logger.record("reward/raw_total", info["reward_raw_total"])
+
+            # Log monitoring metrics (not used in reward)
+            if "capacity_usage_monitor" in info:
+                self.logger.record("monitor/capacity_usage", info["capacity_usage_monitor"])
 
         return True
 

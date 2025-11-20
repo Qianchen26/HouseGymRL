@@ -641,13 +641,16 @@ class BaseEnv(gym.Env):
 
     def _calculate_reward(self, completed: List[int]) -> Dict[str, float]:
         """
-        Calculate reward with four-component architecture (Reward V2).
+        Calculate reward with three-component architecture (Reward V2.1).
 
         Components:
         1. Progress: Dense reward for houses completed this step (incremental)
         2. Completion: Cumulative completion fraction (global state)
-        3. Queue Penalty: Sigmoid penalty for long waiting times
-        4. Capacity Usage: Resource utilization efficiency
+        3. Queue Penalty: Sigmoid penalty with cap at -5.0 (bounded punishment)
+
+        Note: Capacity usage removed as it provides no gradient (always ~1.0 by design).
+              The allocation algorithm aims to use all available capacity, making this
+              metric uninformative for learning.
 
         Args:
             completed: List of house IDs completed this step
@@ -674,18 +677,20 @@ class BaseEnv(gym.Env):
         for house_id in self.waiting_queue.get_all():
             queue_penalty += self._queue_penalty_sigmoid(self.waiting_time[house_id])
 
-        # Component 4: Capacity Usage (资源利用率)
-        # Fraction of available workers actually used
-        capacity_usage = 0.0
-        if self.last_workers_available > 0:
-            capacity_usage = self.last_workers_used / self.last_workers_available
+        # Cap queue penalty to prevent dominance over other signals
+        queue_penalty = max(queue_penalty, -5.0)
 
-        # Weighted combination (before scaling)
+        # Capacity usage (for monitoring only, not used in reward)
+        # Removed from reward because allocation algorithm ensures ~100% usage by design
+        capacity_usage_monitor = 0.0
+        if self.last_workers_available > 0:
+            capacity_usage_monitor = self.last_workers_used / self.last_workers_available
+
+        # Weighted combination (before scaling) - 3 components only
         raw_reward = (
             progress * 1.0 +           # Main signal: incremental progress
             completion * 1.0 +         # Main signal: global completion
-            queue_penalty * 0.1 +      # Secondary: queue management
-            capacity_usage * 0.05      # Minor: resource efficiency
+            queue_penalty * 0.1        # Secondary: queue management (capped at -0.5)
         )
 
         # Scale up by 100x for better SAC learning dynamics
@@ -700,7 +705,7 @@ class BaseEnv(gym.Env):
             "progress": progress,
             "completion": completion,
             "queue_penalty": queue_penalty,
-            "capacity_usage": capacity_usage,
+            "capacity_usage_monitor": capacity_usage_monitor,  # Monitor only
             "raw_total": raw_reward,
         }
 
@@ -895,8 +900,9 @@ class BaseEnv(gym.Env):
             "reward_progress": reward_dict["progress"],
             "reward_completion": reward_dict["completion"],
             "reward_queue_penalty": reward_dict["queue_penalty"],
-            "reward_capacity_usage": reward_dict["capacity_usage"],
             "reward_raw_total": reward_dict["raw_total"],
+            # Monitoring metrics (not used in reward)
+            "capacity_usage_monitor": reward_dict["capacity_usage_monitor"],
         }
 
         return obs, reward, terminated, truncated, info
