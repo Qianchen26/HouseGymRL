@@ -422,14 +422,29 @@ def main():
 
     # 2) Try load latest SAC model
     model = None
+    vec_normalize_wrapper = None
     try:
         runs = sorted(Path("runs").glob("*/sac_model.zip"),
                      key=lambda p: p.stat().st_mtime, reverse=True)
         if runs:
-            model = SAC.load(str(runs[0]))
-            print(f"\nLoaded SAC model: {runs[0]}")
+            model_path = runs[0]
+            model = SAC.load(str(model_path))
+            print(f"\nLoaded SAC model: {model_path}")
             M_inferred = infer_M_from_model(model)
             print(f"  Inferred M={M_inferred} (config M={M_CANDIDATES})")
+
+            # Try to load VecNormalize statistics
+            vec_norm_path = model_path.parent / "vecnormalize.pkl"
+            if vec_norm_path.exists():
+                from stable_baselines3.common.vec_env import VecNormalize
+                import pickle
+                with open(vec_norm_path, 'rb') as f:
+                    vec_normalize_wrapper = pickle.load(f)
+                vec_normalize_wrapper.training = False
+                vec_normalize_wrapper.norm_reward = False
+                print(f"✓ Loaded VecNormalize stats from {vec_norm_path}")
+            else:
+                print(f"⚠ VecNormalize stats not found at {vec_norm_path}")
     except Exception as e:
         print(f"\n[WARN] No SAC model loaded: {e}")
         print("  Running baselines only")
@@ -453,7 +468,14 @@ def main():
     for policy in policies:
         print(f"\nTesting {policy}...")
         if policy == "SAC":
-            traj = rollout(test_env, model=model, max_days=300)
+            # Wrap environment with VecNormalize if available
+            eval_env = test_env
+            if vec_normalize_wrapper is not None:
+                from stable_baselines3.common.vec_env import DummyVecEnv
+                eval_env = DummyVecEnv([lambda: test_env])
+                vec_normalize_wrapper.set_venv(eval_env)
+                eval_env = vec_normalize_wrapper
+            traj = rollout(eval_env, model=model, max_days=300)
         else:
             # Create baseline environment
             baseline_env = create_baseline_env(
@@ -494,7 +516,14 @@ def main():
 
                 if policy == "SAC" and model is not None:
                     env = make_region_env(reg, seed=42)
-                    sim = rollout(env, model=model, max_days=D_obs)
+                    # Wrap with VecNormalize if available
+                    eval_env = env
+                    if vec_normalize_wrapper is not None:
+                        from stable_baselines3.common.vec_env import DummyVecEnv
+                        eval_env = DummyVecEnv([lambda: env])
+                        vec_normalize_wrapper.set_venv(eval_env)
+                        eval_env = vec_normalize_wrapper
+                    sim = rollout(eval_env, model=model, max_days=D_obs)
                 else:
                     env = create_baseline_env(
                         region_key=reg,

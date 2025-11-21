@@ -867,15 +867,19 @@ print("="*70)
 # Reward component logger for TensorBoard
 class RewardComponentLogger(BaseCallback):
     """
-    Logs reward components and monitoring metrics to TensorBoard.
+    Logs reward components, normalized rewards, and monitoring metrics to TensorBoard.
 
-    Reward components (V2.1):
-    - progress: Houses completed this step
-    - completion: Cumulative completion fraction
-    - queue_penalty: Sigmoid penalty (capped at -5.0)
+    Dual logging for reward transparency:
+    - reward_raw/*: Original reward values (reflects true learning progress)
+    - reward_normalized/*: VecNormalize processed rewards (actual training signal)
+
+    Reward components (V3):
+    - progress: Work amount completed this step (action-dependent)
+    - completion: Houses finished this step (sparse bonus)
+    - queue_penalty: Average waiting time penalty (linear, no saturation)
 
     Monitoring metrics (not in reward):
-    - capacity_usage: Resource utilization (always ~1.0 by design)
+    - capacity_usage: Resource utilization
     """
     def __init__(self, verbose=0):
         super().__init__(verbose)
@@ -889,19 +893,31 @@ class RewardComponentLogger(BaseCallback):
         if len(self.locals.get("infos", [])) > 0:
             info = self.locals["infos"][0]
 
-            # Log reward components
-            if "reward_progress" in info:
-                self.logger.record("reward/progress", info["reward_progress"])
-            if "reward_completion" in info:
-                self.logger.record("reward/completion", info["reward_completion"])
-            if "reward_queue_penalty" in info:
-                self.logger.record("reward/queue_penalty", info["reward_queue_penalty"])
+            # ✅ Raw reward components (original values, reflects true progress)
             if "reward_raw_total" in info:
-                self.logger.record("reward/raw_total", info["reward_raw_total"])
+                # Main metric: raw total reward (scaled ×100)
+                self.logger.record("reward_raw/total", info["reward_raw_total"])
 
-            # Log monitoring metrics (not used in reward)
+                # Component details (scaled for better visualization since raw values are small)
+                self.logger.record("reward_raw/progress", info["reward_progress"] * 1000)
+                self.logger.record("reward_raw/completion", info["reward_completion"] * 500)
+                self.logger.record("reward_raw/queue_penalty", info["reward_queue_penalty"] * 100)
+
+            # ✅ Normalized reward (VecNormalize processed, actual training signal)
+            if "rewards" in self.locals:
+                self.logger.record("reward_normalized/step", float(self.locals["rewards"][0]))
+
+            # Log other rollout metrics
+            if "completion" in info:
+                self.logger.record("rollout/completion", info["completion"])
+            if "queue_size" in info:
+                self.logger.record("rollout/queue_size", info["queue_size"])
             if "capacity_usage_monitor" in info:
-                self.logger.record("monitor/capacity_usage", info["capacity_usage_monitor"])
+                self.logger.record("rollout/capacity_usage", info["capacity_usage_monitor"])
+            if "M" in info:
+                self.logger.record("rollout/candidates", info["M"])
+            if "K" in info:
+                self.logger.record("rollout/capacity", info["K"])
 
         return True
 
