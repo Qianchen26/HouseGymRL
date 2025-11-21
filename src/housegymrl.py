@@ -641,16 +641,17 @@ class BaseEnv(gym.Env):
 
     def _calculate_reward(self, completed: List[int]) -> Dict[str, float]:
         """
-        Calculate reward with three-component architecture (Reward V2.1).
+        Calculate reward with action-dependent progress (Reward V3).
 
         Components:
-        1. Progress: Dense reward for houses completed this step (incremental)
-        2. Completion: Cumulative completion fraction (global state)
-        3. Queue Penalty: Sigmoid penalty with cap at -5.0 (bounded punishment)
+        1. Progress: Work amount completed this step (action-dependent, continuous)
+        2. Completion Bonus: Houses finished this step (sparse reward)
+        3. Queue Penalty: Average waiting time (linear, avoids saturation)
 
-        Note: Capacity usage removed as it provides no gradient (always ~1.0 by design).
-              The allocation algorithm aims to use all available capacity, making this
-              metric uninformative for learning.
+        Key improvements over V2.1:
+        - Progress is now based on work amount (∂r/∂a ≠ 0), not house count
+        - Queue penalty uses average waiting time (no longer saturates at -5)
+        - Adjusted weights to emphasize action-dependent signals
 
         Args:
             completed: List of house IDs completed this step
@@ -661,36 +662,45 @@ class BaseEnv(gym.Env):
         revealed_ids = list(self.arrival_system.revealed_ids)
         num_revealed = len(revealed_ids)
 
-        # Component 1: Dense Progress (本步新完成的房屋)
-        # Incremental reward for houses completed in THIS step
+        # Component 1: Action-Dependent Progress (工作量进度)
+        # Calculate actual work completed this step (continuous, action-dependent)
+        work_completed_this_step = 0.0
+        for house_id in revealed_ids:
+            # Work done = reduction in remaining work
+            work_diff = float(self.last_arr_rem[house_id]) - float(self._arr_rem[house_id])
+            work_done = max(0.0, work_diff)
+            work_completed_this_step += work_done
+
+        total_work_initial = float(sum(self._arr_total[h] for h in revealed_ids))
+        progress_reward = float(work_completed_this_step / total_work_initial if total_work_initial > 0 else 0.0)
+
+        # Component 2: Completion Bonus (完成房屋奖励)
+        # Sparse bonus for finishing houses (secondary signal)
         current_completed = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
         new_completed = max(0, current_completed - self.last_completion_count)
-        progress = new_completed / num_revealed if num_revealed > 0 else 0.0
+        completion_bonus = float(new_completed / num_revealed if num_revealed > 0 else 0.0)
 
-        # Component 2: Completion (累积完成比例)
-        # Global progress: total fraction of revealed houses completed
-        completion = current_completed / num_revealed if num_revealed > 0 else 0.0
-
-        # Component 3: Queue Penalty (sigmoid惩罚)
-        # Accumulate sigmoid penalties for all waiting houses
-        queue_penalty = 0.0
-        for house_id in self.waiting_queue.get_all():
-            queue_penalty += self._queue_penalty_sigmoid(self.waiting_time[house_id])
-
-        # Cap queue penalty to prevent dominance over other signals
-        queue_penalty = max(queue_penalty, -5.0)
+        # Component 3: Queue Penalty (队列惩罚 - 修复饱和问题)
+        # Use average waiting time to avoid saturation
+        queue_size = self.waiting_queue.size()
+        if queue_size > 0:
+            waiting_times = [self.waiting_time[h] for h in self.waiting_queue.get_all()]
+            avg_waiting = float(np.mean(waiting_times))
+            # Linear penalty: only penalize when average wait exceeds threshold
+            queue_penalty = float(-max(0.0, (avg_waiting - 40.0) / 100.0))
+        else:
+            queue_penalty = 0.0
 
         # Capacity usage (for monitoring only, not used in reward)
-        # Removed from reward because allocation algorithm ensures ~100% usage by design
         capacity_usage_monitor = 0.0
         if self.last_workers_available > 0:
             capacity_usage_monitor = self.last_workers_used / self.last_workers_available
 
-        # Weighted combination (before scaling) - 3 components only
+        # Weighted combination (before scaling)
         raw_reward = (
-            progress * 1.0 +           # Main signal: incremental progress
-            completion * 1.0 +         # Main signal: global completion
-            queue_penalty * 0.1        # Secondary: queue management (capped at -0.5)
+            progress_reward * 10.0 +      # Main signal: action-dependent work progress
+            completion_bonus * 5.0 +      # Secondary: house completion bonus
+            queue_penalty * 1.0           # Soft constraint: queue management
         )
 
         # Scale up by 100x for better SAC learning dynamics
@@ -698,14 +708,15 @@ class BaseEnv(gym.Env):
 
         # Update state for next step
         self.last_completion_count = current_completed
+        self.last_arr_rem = self._arr_rem.copy()
 
         # Return all components for TensorBoard logging
         return {
             "total": scaled_reward,
-            "progress": progress,
-            "completion": completion,
+            "progress": progress_reward,
+            "completion": completion_bonus,
             "queue_penalty": queue_penalty,
-            "capacity_usage_monitor": capacity_usage_monitor,  # Monitor only
+            "capacity_usage_monitor": capacity_usage_monitor,
             "raw_total": raw_reward,
         }
 
@@ -896,6 +907,7 @@ class BaseEnv(gym.Env):
             "K": self.current_day_capacity,
             "revealed_count": self.arrival_system.get_revealed_count(),
             "M": self.current_day_initial_candidates,
+            "day_advanced": True,  # Signal that a real day has passed
             # Reward components for TensorBoard logging
             "reward_progress": reward_dict["progress"],
             "reward_completion": reward_dict["completion"],
@@ -982,6 +994,7 @@ class BaseEnv(gym.Env):
 
         # Reset work arrays
         self._arr_rem = self._arr_total.copy()
+        self.last_arr_rem = self._arr_rem.copy()  # Track previous step's remaining work
 
         # Reset systems
         if isinstance(self.arrival_system, TrueBatchArrival):
