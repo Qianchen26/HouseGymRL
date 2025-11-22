@@ -1,0 +1,28 @@
+# Stage 3b: Current Configuration (All Mechanisms)
+# 当前配置 - 所有不确定性机制全开
+
+experiment_name: stage3b_current_all
+description: 当前配置 - 所有不确定性机制（批次到达 + 随机进度 + 观测噪声15% + 容量噪声10%）
+stage: 3
+
+environment:
+  use_batch_arrival: true
+  stochastic_duration: true
+  observation_noise: 0.15
+  capacity_noise: 0.10
+
+training:
+  total_timesteps: 500000
+  n_envs: 16
+
+evaluation:
+  test_regions:
+    - Mataram
+    - Sumbawa
+    - Central Lombok
+  crew_levels:
+    - 0.3
+    - 0.5
+    - 0.7
+    - 1.0
+  n_seeds: 5

@@ -1,0 +1,28 @@
+# Stage 1d: Capacity Noise Only
+# 仅开启容量噪声（10% reduction range）
+
+experiment_name: stage1d_capacity_noise_only
+description: 单一不确定性 - 仅容量噪声（capacity sampled from [90%, 100%] of base）
+stage: 1
+
+environment:
+  use_batch_arrival: false
+  stochastic_duration: false
+  observation_noise: 0.0
+  capacity_noise: 0.10
+
+training:
+  total_timesteps: 500000
+  n_envs: 16
+
+evaluation:
+  test_regions:
+    - Mataram
+    - Sumbawa
+    - Central Lombok
+  crew_levels:
+    - 0.3
+    - 0.5
+    - 0.7
+    - 1.0
+  n_seeds: 5
