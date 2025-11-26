@@ -37,25 +37,17 @@ CAPACITY_RAMP_ENABLED = False
 # ============================================================================
 # Candidate Selection Strategy
 # ============================================================================
-# IMPORTANT: Candidate selection is now PURE RANDOM
-# - No artificial bias (no LJF/SJF pre-filtering)
-# - RL must learn to identify important tasks from natural samples
-# - Tests true robustness when candidate quality is not guaranteed
-#
-# This design choice is intentional:
-# 1. More honest: We don't assume we know how to pre-filter
-# 2. More natural: Real-world information acquisition is random
-# 3. Stronger test: RL must work with whatever candidates appear
-# 4. True robustness: Performance when we can't control input quality
-
-CANDIDATE_SELECTION = "pure_random"  # The only strategy - no configuration needed
+# Candidate selection strategy: longest-waiting Top-M
+CANDIDATE_SELECTION = "longest_wait"
 
 # Environment sizing constants
-M_CANDIDATES = 512  # Increased from 256 to 512 for better capacity utilization
+# PPO version: M is FIXED at 1024 to avoid variable observation dimensions
+M_FIXED = 1024  # Fixed candidate pool size (no longer adaptive)
 MAX_STEPS = 500
-OBS_G = 6
-OBS_F = 4
-EXPECTED_OBS_DIM = OBS_G + M_CANDIDATES * OBS_F  # Now 6 + 512*4 = 2054 dimensions
+OBS_G = 6  # Global features (day, capacity, queue_size, etc.)
+# Per-candidate features: remain, waiting_time, total_work, damage_level, cmax, mask
+OBS_F = 6
+EXPECTED_OBS_DIM = OBS_G + M_FIXED * OBS_F  # 6 + 1024*6 = 6150 dimensions
 
 # ============================================================================
 # Cross-availability configuration
@@ -132,7 +124,8 @@ GENERALIZATION_CONFIG = {
 }
 
 # Data location
-DATA_DIR = Path("data")
+# Point to project root data directory (from ppo/src/ -> housegymrl/data/)
+DATA_DIR = Path(__file__).parent.parent.parent / "data"
 OBSERVED_DATA_PATH = DATA_DIR / "lombok_data.pkl"
 
 # ============================================================================

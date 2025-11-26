@@ -61,7 +61,10 @@ def load_model_and_vecnorm(checkpoint_dir: str) -> Tuple[PPO, VecNormalize]:
     model = PPO.load(str(model_file))
 
     # Load VecNormalize stats (will be applied to eval env later)
-    vec_norm_dummy = VecNormalize.load(str(vecnorm_file), DummyVecEnv([lambda: RLEnv("Mataram", M_min=512, M_max=512)]))
+    vec_norm_dummy = VecNormalize.load(
+        str(vecnorm_file),
+        DummyVecEnv([lambda: RLEnv("Mataram", M_min=1024, M_max=1024)])
+    )
 
     return model, vec_norm_dummy
 
@@ -102,21 +105,22 @@ def evaluate_on_scenario(
     results = []
 
     for seed in range(n_seeds):
-        # Create eval environment
-        env = RLEnv(
-            region_key=region,
-            num_contractors=num_contractors,
-            M_min=512,
-            M_max=512,
-            use_batch_arrival=True,
-            stochastic_duration=True,
-            observation_noise=0.15,
-            capacity_noise=0.10,
-            seed=1000 + seed,
-        )
+        # Create eval environment factory (fix lambda closure bug)
+        def make_env(seed_val=seed, num_contr=num_contractors, reg=region):
+            return RLEnv(
+                region_key=reg,
+                num_contractors=num_contr,
+                M_min=1024,
+                M_max=1024,
+                use_batch_arrival=True,
+                stochastic_duration=True,
+                observation_noise=0.15,
+                capacity_noise=0.10,
+                seed=1000 + seed_val,
+            )
 
         # Wrap with VecNormalize (use training stats, disable training mode)
-        vec_env = DummyVecEnv([lambda: env])
+        vec_env = DummyVecEnv([make_env])
         vec_env = VecNormalize(vec_env, training=False, norm_obs=True, norm_reward=False)
         vec_env.obs_rms = vec_norm.obs_rms  # Use training normalization stats
 
@@ -195,6 +199,7 @@ def evaluate_cross_scenarios(
         for crew_level in crew_levels:
             current += 1
             print(f"\n[{current}/{total_scenarios}] Evaluating {region} @ {crew_level:.0%} crew...")
+            sys.stdout.flush()
 
             scenario_results = evaluate_on_scenario(
                 model, vec_norm, region, crew_level, n_seeds
@@ -243,8 +248,8 @@ def run_baseline(
             region_key=region,
             policy=policy,
             num_contractors=num_contractors,
-            M_min=512,
-            M_max=512,
+            M_min=1024,
+            M_max=1024,
             seed=1000 + seed,
         )
 

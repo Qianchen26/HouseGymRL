@@ -17,7 +17,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 from stable_baselines3 import PPO
@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from housegymrl import RLEnv
 from ppo_configs import PPOConfig, TrainingConfig, EnvironmentConfig
+from synthetic_scenarios import generate_scenarios, register_dataframe
 
 
 # ============================================================================
@@ -94,7 +95,61 @@ class ProgressCallback(BaseCallback):
         return True
 
 
-def create_training_env(rank: int, env_config: EnvironmentConfig, region_key: str = "Mataram") -> callable:
+class RewardComponentCallback(BaseCallback):
+    """
+    Log reward components to TensorBoard by aggregating info dicts.
+
+    Expects env infos to include:
+    - reward_progress
+    - reward_completion
+    - reward_queue_penalty
+    - reward_raw_total
+    """
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose)
+        self.progress = []
+        self.completion = []
+        self.queue_penalty = []
+        self.raw_total = []
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", [])
+        for info in infos:
+            if not isinstance(info, dict):
+                continue
+            if "reward_progress" in info:
+                self.progress.append(info["reward_progress"])
+            if "reward_completion" in info:
+                self.completion.append(info["reward_completion"])
+            if "reward_queue_penalty" in info:
+                self.queue_penalty.append(info["reward_queue_penalty"])
+            if "reward_raw_total" in info:
+                self.raw_total.append(info["reward_raw_total"])
+        return True
+
+    def _on_rollout_end(self) -> bool:
+        def _log_mean(name: str, data: list):
+            if data:
+                self.logger.record(name, float(np.mean(data)))
+        _log_mean("reward_components/progress", self.progress)
+        _log_mean("reward_components/completion", self.completion)
+        _log_mean("reward_components/queue_penalty", self.queue_penalty)
+        _log_mean("reward_components/raw_total", self.raw_total)
+        self.progress.clear()
+        self.completion.clear()
+        self.queue_penalty.clear()
+        self.raw_total.clear()
+        return True
+
+
+def create_training_env(
+    rank: int,
+    env_config: EnvironmentConfig,
+    region_key: str = "Mataram",
+    synthetic_region_keys: Optional[List[str]] = None,
+    synthetic_seed: int = 42,
+) -> Callable:
     """
     Create a single training environment.
 
@@ -102,6 +157,10 @@ def create_training_env(rank: int, env_config: EnvironmentConfig, region_key: st
         rank: Environment rank for seed generation (integer, 0 to n_envs-1).
         env_config: Environment configuration dataclass containing uncertainty parameters.
         region_key: Region name from REGION_CONFIG (string, e.g., "Mataram").
+            Used when synthetic_region_keys is None.
+        synthetic_region_keys: List of synthetic region keys for multi-scenario training.
+            If provided, each env randomly selects from these keys.
+        synthetic_seed: Seed for generating synthetic scenarios (must match main process).
 
     Returns:
         Callable that creates and returns a Monitor-wrapped RLEnv instance.
@@ -111,8 +170,20 @@ def create_training_env(rank: int, env_config: EnvironmentConfig, region_key: st
         >>> env = env_fn()
     """
     def _init():
+        # Select region: use synthetic rotation if available, else fixed region
+        if synthetic_region_keys is not None and len(synthetic_region_keys) > 0:
+            # IMPORTANT: Register synthetic scenarios in subprocess
+            # SubprocVecEnv runs in separate processes that don't inherit main process state
+            synthetic_df = generate_scenarios(random_seed=synthetic_seed)
+            register_dataframe(synthetic_df)
+
+            rng = np.random.default_rng(42 + rank)
+            selected_region = rng.choice(synthetic_region_keys)
+        else:
+            selected_region = region_key
+
         env = RLEnv(
-            region_key=region_key,
+            region_key=selected_region,
             M_min=env_config.M_min,
             M_max=env_config.M_max,
             use_batch_arrival=env_config.use_batch_arrival,
@@ -132,7 +203,9 @@ def setup_vec_env(
     n_envs: int,
     env_config: EnvironmentConfig,
     region_key: str = "Mataram",
-    use_subprocess: bool = True
+    use_subprocess: bool = True,
+    synthetic_region_keys: Optional[List[str]] = None,
+    synthetic_seed: int = 42,
 ) -> VecNormalize:
     """
     Set up vectorized environment with normalization.
@@ -140,10 +213,12 @@ def setup_vec_env(
     Args:
         n_envs: Number of parallel environments (integer, e.g., 16).
         env_config: Environment configuration dataclass.
-        region_key: Region name (string).
+        region_key: Region name (string). Used when synthetic_region_keys is None.
         use_subprocess: Use SubprocVecEnv for parallelization (boolean).
             If True, environments run in separate processes (faster).
             If False, use DummyVecEnv (sequential, easier debugging).
+        synthetic_region_keys: List of synthetic region keys for multi-scenario training.
+            If provided, each env randomly selects from these keys.
 
     Returns:
         VecNormalize instance wrapping vectorized environments.
@@ -155,7 +230,10 @@ def setup_vec_env(
         >>> vec_env = setup_vec_env(8, ENV_DEFAULT)
         >>> obs = vec_env.reset()  # shape: (8, 2054)
     """
-    env_fns = [create_training_env(i, env_config, region_key) for i in range(n_envs)]
+    env_fns = [
+        create_training_env(i, env_config, region_key, synthetic_region_keys, synthetic_seed)
+        for i in range(n_envs)
+    ]
 
     if use_subprocess and n_envs > 1:
         vec_env = SubprocVecEnv(env_fns)
@@ -195,9 +273,13 @@ def create_ppo_model(
     Example:
         >>> model = create_ppo_model(vec_env, PPO_DEFAULT, "runs/experiment1/tb_logs")
     """
+    # Larger network for 6150-dim input (default 64x64 is too small)
+    policy_kwargs = dict(net_arch=[256, 256])
+
     model = PPO(
         "MlpPolicy",
         vec_env,
+        policy_kwargs=policy_kwargs,
         learning_rate=ppo_config.learning_rate,
         n_steps=ppo_config.n_steps,
         batch_size=ppo_config.batch_size,
@@ -254,7 +336,9 @@ def setup_callbacks(
         save_vecnormalize=True,
     )
 
-    callbacks = [progress_callback, checkpoint_callback]
+    reward_callback = RewardComponentCallback()
+
+    callbacks = [progress_callback, reward_callback, checkpoint_callback]
 
     if eval_env is not None:
         eval_dir = Path(save_dir) / "eval"
@@ -281,6 +365,8 @@ def train_ppo(
     training_config: TrainingConfig = TrainingConfig(),
     env_config: EnvironmentConfig = EnvironmentConfig(),
     resume_from: Optional[str] = None,
+    use_synthetic: bool = False,
+    synthetic_seed: int = 42,
 ) -> None:
     """
     Main PPO training function.
@@ -288,10 +374,13 @@ def train_ppo(
     Args:
         experiment_name: Experiment name (string, used for saving and logging).
         region_key: Training region name (string, e.g., "Mataram").
+            Used when use_synthetic is False.
         ppo_config: PPO hyperparameters (PPOConfig dataclass).
         training_config: Training loop settings (TrainingConfig dataclass).
         env_config: Environment settings (EnvironmentConfig dataclass).
         resume_from: Path to checkpoint to resume from (string or None).
+        use_synthetic: If True, train on 180 synthetic scenarios for robustness.
+        synthetic_seed: Seed for generating synthetic scenarios.
 
     Side effects:
         - Creates directory structure: runs/{experiment_name}/
@@ -309,7 +398,19 @@ def train_ppo(
     print(f"Starting PPO Training: {experiment_name}")
     print(f"{'='*80}\n")
 
-    print(f"Region: {region_key}")
+    # Handle synthetic scenario generation
+    synthetic_region_keys = None
+    if use_synthetic:
+        print("Generating 180 synthetic training scenarios...")
+        synthetic_df = generate_scenarios(random_seed=synthetic_seed)
+        register_dataframe(synthetic_df)
+        synthetic_region_keys = synthetic_df['region_key'].tolist()
+        print(f"Registered {len(synthetic_region_keys)} synthetic scenarios")
+        print(f"Training mode: Multi-scenario rotation (robustness training)")
+    else:
+        print(f"Region: {region_key}")
+        print(f"Training mode: Single region")
+
     print(f"Total timesteps: {training_config.total_timesteps:,}")
     print(f"Parallel envs: {training_config.n_envs}")
     print(f"Uncertainty: batch_arrival={env_config.use_batch_arrival}, "
@@ -331,6 +432,8 @@ def train_ppo(
         env_config=env_config,
         region_key=region_key,
         use_subprocess=True,
+        synthetic_region_keys=synthetic_region_keys,
+        synthetic_seed=synthetic_seed,
     )
 
     # Create or load model
@@ -423,7 +526,7 @@ def main():
     parser.add_argument(
         "--timesteps",
         type=int,
-        default=500_000,
+        default=1_000_000,
         help="Total training timesteps",
     )
 
@@ -468,6 +571,20 @@ def main():
         help="Capacity noise level (0.0 = fixed capacity)",
     )
 
+    # Synthetic training
+    parser.add_argument(
+        "--use-synthetic",
+        action="store_true",
+        help="Train on 180 synthetic scenarios for robustness (ignores --region)",
+    )
+
+    parser.add_argument(
+        "--synthetic-seed",
+        type=int,
+        default=42,
+        help="Seed for synthetic scenario generation",
+    )
+
     args = parser.parse_args()
 
     # Build configurations
@@ -491,6 +608,8 @@ def main():
         training_config=training_config,
         env_config=env_config,
         resume_from=args.resume_from,
+        use_synthetic=args.use_synthetic,
+        synthetic_seed=args.synthetic_seed,
     )
 
 

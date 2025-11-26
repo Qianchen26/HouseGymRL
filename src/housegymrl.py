@@ -3,7 +3,7 @@ HouseGym RL Environment - Enhanced Version
 ==========================================
 
 Core Design Principles:
-1. Pure random candidate selection (no artificial bias)
+1. Top-M by waiting time (surface longest-waiting houses)
 2. Batch arrival system (simulates real assessment timeline)
 3. Capacity ramp system (simulates contractor mobilization)
 4. Focus on robustness and generalization, not peak performance
@@ -32,7 +32,6 @@ import pickle
 # Import configuration
 import config
 from config import (
-    M_CANDIDATES,
     MAX_STEPS,
     COMBINED_ARRIVAL_CAPACITY_CONFIG,
     WORK_PARAMS,
@@ -260,7 +259,7 @@ class BaseEnv(gym.Env):
     Key features:
     - Batch arrival (information gradually revealed)
     - Capacity ramp (resources gradually available, currently disabled)
-    - Pure random candidate selection (no artificial bias)
+    - Top-M candidate selection by waiting time (fairness-first visibility)
     - Fair constraints for all strategies (RL/baseline)
     """
 
@@ -271,14 +270,13 @@ class BaseEnv(gym.Env):
         region_key: str,
         num_contractors: Optional[int] = None,
         M_ratio: float = 0.10,
-        M_min: int = 512,
-        M_max: int = 2048,
+        M_min: int = 1024,
+        M_max: int = 1024,
         use_batch_arrival: bool = True,
         use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
-        observation_noise: float = 0.02,
-        capacity_noise: float = 0.02,
-        use_longterm_reward: bool = True,
+        observation_noise: float = 0.15,
+        capacity_noise: float = 0.10,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
     ):
@@ -294,9 +292,8 @@ class BaseEnv(gym.Env):
             use_batch_arrival: Whether to use batch arrival system
             use_capacity_ramp: Whether to use capacity ramp system
             stochastic_duration: Whether work progress is stochastic (default: True)
-            observation_noise: Std dev of observation noise as fraction of true value (default: 0.02)
-            capacity_noise: Range of capacity reduction (default: 0.02 = 98%-100% of base)
-            use_longterm_reward: Whether to use long-term reward function (default: True)
+            observation_noise: Std dev of observation noise as fraction of true value (default: 0.15)
+            capacity_noise: Range of capacity reduction (default: 0.10 = 90%-100% of base)
             seed: Random seed
             max_steps: Maximum simulation days
         """
@@ -325,10 +322,11 @@ class BaseEnv(gym.Env):
         self.max_steps = max_steps
 
         # Set stochasticity parameters
+        self.use_batch_arrival = use_batch_arrival
         self.stochastic_duration = stochastic_duration
+        self.observation_noise = observation_noise
         self.obs_noise = observation_noise
         self.capacity_noise = capacity_noise
-        self.use_longterm_reward = use_longterm_reward
 
         # Load scenario data
         self.tasks_df = self._load_scenario(region_key)
@@ -338,6 +336,10 @@ class BaseEnv(gym.Env):
         self._arr_rem = self.tasks_df['man_days_remaining'].values.copy().astype(np.float32)
         self._arr_dmg = self.tasks_df['damage_level'].values.astype(np.int32)
         self._arr_cmax = self.tasks_df['cmax_per_day'].values.astype(np.float32)
+        self.capacity_ceiling = int(self.M_max * float(self._arr_cmax.max()))
+
+        # Fix Critical Issue #3: Compute fixed total work for consistent reward scaling
+        self._total_work_all = float(sum(self._arr_total))
 
         # Initialize systems
         if use_batch_arrival:
@@ -456,8 +458,10 @@ class BaseEnv(gym.Env):
 
         Uses M_max to ensure fixed space dimensions across episodes.
         """
-        # Observation: 6 global features + M_max*4 candidate features
-        obs_dim = 6 + self.M_max * 4
+        # Observation: 6 global features + M_max*6 candidate features
+        # Candidate features: [remain, waiting_time, total_work, damage_level, cmax, mask]
+        candidate_feature_dim = 6
+        obs_dim = 6 + self.M_max * candidate_feature_dim
         self.observation_space = spaces.Box(
             low=0.0,
             high=np.inf,
@@ -465,22 +469,13 @@ class BaseEnv(gym.Env):
             dtype=np.float32
         )
 
-        # Action: M_max candidate scores + 1 no-op signal
+        # Action: one priority score per candidate
         self.action_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.M_max + 1,),
+            shape=(self.M_max,),
             dtype=np.float32
         )
-
-    def _build_action_mask(self) -> np.ndarray:
-        """Build an action mask for the current pending candidates."""
-        mask = np.zeros(self.M_max + 1, dtype=np.float32)
-        num_candidates = min(len(self.pending_candidates), self.M_max)
-        if num_candidates > 0:
-            mask[:num_candidates] = 1.0
-        mask[self.M_max] = 1.0  # no-op always allowed
-        return mask
 
     def _get_capacity_for_day(self, day: int) -> int:
         """Sample capacity for a specific day (with noise if enabled)."""
@@ -488,6 +483,8 @@ class BaseEnv(gym.Env):
         if self.capacity_noise > 0 and base_capacity > 0:
             noise_factor = self.rng.uniform(1.0 - self.capacity_noise, 1.0)
             base_capacity = int(base_capacity * noise_factor)
+        if self.capacity_ceiling:
+            base_capacity = min(base_capacity, self.capacity_ceiling)
         return max(0, base_capacity)
 
     def _effective_capacity(self) -> int:
@@ -564,24 +561,6 @@ class BaseEnv(gym.Env):
         """
         return self.day
 
-    def get_candidate_seed_for_step(self, step_num: int) -> int:
-        """
-        Get the seed that was/will be used for candidate selection in step N.
-
-        Args:
-            step_num: The step number (1-indexed)
-
-        Returns:
-            The seed value used for candidate selection
-
-        Example:
-            After 50 steps, to reproduce the candidates from step 50:
-            seed = env.get_candidate_seed_for_step(50)  # Returns seed for day 49
-        """
-        # Step N uses day N-1 for decisions
-        decision_day = max(0, step_num - 1)
-        return (self.seed if self.seed is not None else 42) + decision_day * 1000
-
     def _apply_work(self, allocation: Dict[int, int]):
         """
         Apply work allocation with stochastic progress.
@@ -604,42 +583,17 @@ class BaseEnv(gym.Env):
                     expected_progress * 0.20
                 )
                 actual_progress = max(0, actual_progress)
+                # Do not exceed remaining work
+                actual_progress = min(actual_progress, self._arr_rem[house_id])
             else:
                 # Deterministic progress (legacy mode)
-                actual_progress = workers
+                actual_progress = min(workers, self._arr_rem[house_id])
 
             # Update remaining work
             self._arr_rem[house_id] -= actual_progress
             self._arr_rem[house_id] = max(0, self._arr_rem[house_id])
 
-    def _queue_penalty_sigmoid(
-        self,
-        waiting_time: int,
-        midpoint: int = 50,
-        steepness: float = 0.1,
-        max_penalty: float = 0.1
-    ) -> float:
-        """
-        Sigmoid penalty function for queue waiting time.
-
-        Penalty curve:
-        - waiting_time < midpoint: small penalty (gradual increase)
-        - waiting_time = midpoint: penalty = max_penalty / 2
-        - waiting_time >> midpoint: penalty → max_penalty (saturates)
-
-        Args:
-            waiting_time: Days the house has been waiting
-            midpoint: Inflection point (default: 50 days)
-            steepness: Controls how fast penalty grows (default: 0.1)
-            max_penalty: Maximum penalty value (default: 0.1)
-
-        Returns:
-            Negative penalty value (always ≤ 0)
-        """
-        penalty = max_penalty / (1 + np.exp(-steepness * (waiting_time - midpoint)))
-        return -penalty
-
-    def _calculate_reward(self, completed: List[int]) -> Dict[str, float]:
+    def _calculate_reward(self) -> Dict[str, float]:
         """
         Calculate reward with action-dependent progress (Reward V3).
 
@@ -652,9 +606,6 @@ class BaseEnv(gym.Env):
         - Progress is now based on work amount (∂r/∂a ≠ 0), not house count
         - Queue penalty uses average waiting time (no longer saturates at -5)
         - Adjusted weights to emphasize action-dependent signals
-
-        Args:
-            completed: List of house IDs completed this step
 
         Returns:
             Dictionary with individual components and total scaled reward
@@ -671,8 +622,9 @@ class BaseEnv(gym.Env):
             work_done = max(0.0, work_diff)
             work_completed_this_step += work_done
 
-        total_work_initial = float(sum(self._arr_total[h] for h in revealed_ids))
-        progress_reward = float(work_completed_this_step / total_work_initial if total_work_initial > 0 else 0.0)
+        # Fix Critical Issue #3: Use fixed denominator to maintain temporal consistency
+        # Previously used sum(revealed_ids) which changed with batch arrival
+        progress_reward = float(work_completed_this_step / self._total_work_all if self._total_work_all > 0 else 0.0)
 
         # Component 2: Completion Bonus (完成房屋奖励)
         # Sparse bonus for finishing houses (secondary signal)
@@ -686,8 +638,10 @@ class BaseEnv(gym.Env):
         if queue_size > 0:
             waiting_times = [self.waiting_time[h] for h in self.waiting_queue.get_all()]
             avg_waiting = float(np.mean(waiting_times))
-            # Linear penalty: only penalize when average wait exceeds threshold
-            queue_penalty = float(-max(0.0, (avg_waiting - 40.0) / 100.0))
+            # Linear penalty with relaxed threshold/slope and cap
+            # threshold=80, slope=/300, cap=-0.5 to prevent dominating reward
+            raw_penalty = -max(0.0, (avg_waiting - 80.0) / 300.0)
+            queue_penalty = float(max(-0.5, raw_penalty))
         else:
             queue_penalty = 0.0
 
@@ -698,12 +652,12 @@ class BaseEnv(gym.Env):
 
         # Weighted combination (before scaling)
         raw_reward = (
-            progress_reward * 10.0 +      # Main signal: action-dependent work progress
-            completion_bonus * 5.0 +      # Secondary: house completion bonus
-            queue_penalty * 1.0           # Soft constraint: queue management
+            progress_reward * 15.0 +     # Boost progress signal
+            completion_bonus * 7.0 +     # Boost completion signal
+            queue_penalty * 0.05         # Reduce queue penalty weight
         )
 
-        # Scale up by 100x for better SAC learning dynamics
+        # Scale up by 100x for better learning dynamics
         scaled_reward = raw_reward * 100.0
 
         # Update state for next step
@@ -722,28 +676,31 @@ class BaseEnv(gym.Env):
 
     def _select_candidates(self, queue_ids: List[int]) -> List[int]:
         """
-        Adaptive random candidate selection.
+        Top-M candidate selection by waiting time.
 
-        Samples M candidates where M = ratio × queue_size, clamped to [M_min, M_max].
+        Samples M candidates where M = ratio × queue_size, clamped to [M_min, M_max],
+        then takes the longest-waiting houses first.
         Uses instance RNG for true stochasticity across different runs.
 
         Args:
             queue_ids: All houses in queue
 
         Returns:
-            Randomly selected M candidates
+            Top-M candidates by waiting time (longest waiting first)
         """
-        # Calculate adaptive M
-        M = self._get_M(len(queue_ids))
+        queue_size = len(queue_ids)
+        if queue_size == 0:
+            return []
 
-        if len(queue_ids) <= M:
-            return queue_ids
+        M = self._get_M(queue_size)
 
-        # Use instance RNG for stochastic selection
-        # This allows different policies to see different candidate sequences,
-        # creating a truly stochastic environment for RL to learn from
-        selected = self.rng.choice(queue_ids, size=M, replace=False)
-        return selected.tolist()
+        # Sort by waiting time (descending). Tie-breaker by house_id for determinism.
+        sorted_ids = sorted(queue_ids, key=lambda h: (self.waiting_time[h], h), reverse=True)
+
+        if queue_size <= M:
+            return sorted_ids
+
+        return sorted_ids[:M]
 
     def step(self, action):
         """
@@ -884,7 +841,7 @@ class BaseEnv(gym.Env):
             #     print(f"            WARNING: revealed_ids is empty at day {self.day}!")
 
         # Calculate reward using new four-component reward function
-        reward_dict = self._calculate_reward(completed)
+        reward_dict = self._calculate_reward()
         reward = reward_dict["total"]
         self.last_completion = completion
 
@@ -898,11 +855,20 @@ class BaseEnv(gym.Env):
         # Get observation
         obs = self._get_obs()
 
+        # Calculate average queue time for revealed houses
+        revealed_ids = list(self.arrival_system.revealed_ids)
+        if len(revealed_ids) > 0:
+            avg_queue_time = float(np.mean([self.waiting_time[h] for h in revealed_ids]))
+        else:
+            avg_queue_time = 0.0
+
         info = {
             "day": self.day,  # Keep for backward compatibility
             "completed_days": self.day,  # More explicit: days 0 through day-1 are complete
             "decision_day": self.day - 1 if self.day > 0 else 0,  # Day used for this step's decisions
             "completion": completion,
+            "completion_rate": completion,  # Alias for evaluate_ppo.py compatibility
+            "avg_queue_time": avg_queue_time,  # Average waiting time for revealed houses
             "queue_size": self.waiting_queue.size(),
             "K": self.current_day_capacity,
             "revealed_count": self.arrival_system.get_revealed_count(),
@@ -925,7 +891,7 @@ class BaseEnv(gym.Env):
 
         Structure:
         - 6 global features
-        - M_max*4 candidate features (padded with zeros if M < M_max)
+        - M_max*6 candidate features (padded with zeros if M < M_max)
         """
         # Global features
         revealed_ids = list(self.arrival_system.revealed_ids)
@@ -953,7 +919,7 @@ class BaseEnv(gym.Env):
         # Candidate features (use M_max for fixed size, pad with zeros)
         candidates = self.pending_candidates if self.pending_candidates else []
 
-        candidate_features = np.zeros((self.M_max, 4), dtype=np.float32)
+        candidate_features = np.zeros((self.M_max, 6), dtype=np.float32)
         for i, house_id in enumerate(candidates):
             if i >= self.M_max:
                 break
@@ -973,8 +939,10 @@ class BaseEnv(gym.Env):
 
             candidate_features[i] = [
                 observed_remain,
-                self._arr_dmg[house_id],
-                self._arr_cmax[house_id],
+                float(self.waiting_time[house_id]),
+                float(self._arr_total[house_id]),
+                float(self._arr_dmg[house_id]),
+                float(self._arr_cmax[house_id]),
                 1.0  # mask: valid
             ]
 
@@ -1003,6 +971,9 @@ class BaseEnv(gym.Env):
                 COMBINED_ARRIVAL_CAPACITY_CONFIG["batch_arrival"],
                 self.seed if self.seed is not None else 42
             )
+        elif isinstance(self.arrival_system, StaticArrival):
+            # Fix Critical Issue #1: Reset StaticArrival to avoid empty queue on second episode
+            self.arrival_system = StaticArrival(self.tasks_df)
 
         self.waiting_queue = WaitingQueue()
         self.day = 0
@@ -1098,14 +1069,21 @@ class RLEnv(BaseEnv):
             for i in range(M)
         ], dtype=np.float64)
 
+        # Fix Critical Issue #2: Get remaining work for each candidate
+        remaining_work_array = np.array([
+            self._arr_rem[candidates[i]]
+            for i in range(M)
+        ], dtype=np.float64)
+
         # Step 1: Softmax allocation (ideal distribution)
         # Subtract max for numerical stability
         exp_p = np.exp(priorities - np.max(priorities))
         probs = exp_p / (exp_p.sum() + 1e-10)  # Add epsilon to prevent division by zero
         ideal_allocation = probs * K
 
-        # Step 2: Clip by cmax constraints
-        allocation = np.minimum(ideal_allocation, cmax_array)
+        # Step 2: Clip by cmax AND remaining_work constraints
+        # This prevents over-allocation to nearly-complete houses
+        allocation = np.minimum(ideal_allocation, np.minimum(cmax_array, remaining_work_array))
 
         # Step 3: Redistribute leftover capacity
         used = allocation.sum()
@@ -1113,7 +1091,8 @@ class RLEnv(BaseEnv):
 
         if leftover > 1e-6:  # If there's significant leftover capacity
             # Find houses that can accept more contractors
-            can_take_more = cmax_array - allocation
+            # Must consider BOTH cmax constraint AND remaining work
+            can_take_more = np.minimum(cmax_array, remaining_work_array) - allocation
             can_take_more = np.maximum(can_take_more, 0)
 
             if can_take_more.sum() > 1e-6:
@@ -1176,14 +1155,13 @@ class BaselineEnv(BaseEnv):
         policy: str,
         num_contractors: Optional[int] = None,
         M_ratio: float = 0.10,
-        M_min: int = 512,
-        M_max: int = 2048,
+        M_min: int = 1024,
+        M_max: int = 1024,
         use_batch_arrival: bool = True,
         use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
         observation_noise: float = 0.15,
         capacity_noise: float = 0.10,
-        use_longterm_reward: bool = True,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
     ):
@@ -1205,7 +1183,6 @@ class BaselineEnv(BaseEnv):
             stochastic_duration=stochastic_duration,
             observation_noise=observation_noise,
             capacity_noise=capacity_noise,
-            use_longterm_reward=use_longterm_reward,
             seed=seed,
             max_steps=max_steps,
         )
@@ -1278,14 +1255,13 @@ class OracleEnv(BaseEnv):
         policy: str,
         num_contractors: Optional[int] = None,
         M_ratio: float = 0.10,
-        M_min: int = 512,
-        M_max: int = 2048,
+        M_min: int = 1024,
+        M_max: int = 1024,
         use_batch_arrival: bool = True,
         use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
         observation_noise: float = 0.15,
         capacity_noise: float = 0.10,
-        use_longterm_reward: bool = True,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
     ):
@@ -1307,7 +1283,6 @@ class OracleEnv(BaseEnv):
             stochastic_duration=stochastic_duration,
             observation_noise=observation_noise,
             capacity_noise=capacity_noise,
-            use_longterm_reward=use_longterm_reward,
             seed=seed,
             max_steps=max_steps,
         )

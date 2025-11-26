@@ -38,14 +38,14 @@ class PPOConfig:
         device: Device for computation ('auto', 'cpu', 'cuda').
     """
 
-    learning_rate: float = 3e-4
+    learning_rate: float = 2e-5
     n_steps: int = 2048
-    batch_size: int = 256
-    n_epochs: int = 10
+    batch_size: int = 512
+    n_epochs: int = 3
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_range: float = 0.2
-    ent_coef: float = 0.01
+    clip_range: float = 0.06
+    ent_coef: float = 0.03
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     device: str = 'auto'
@@ -69,7 +69,7 @@ class TrainingConfig:
             Example: 10 → log average reward every 10 episodes.
     """
 
-    total_timesteps: int = 500_000
+    total_timesteps: int = 1_000_000
     n_envs: int = 16
     save_freq: int = 50_000
     eval_freq: int = 100_000
@@ -94,8 +94,8 @@ class EnvironmentConfig:
         max_steps: Maximum episode length in days.
     """
 
-    M_min: int = 512
-    M_max: int = 512
+    M_min: int = 1024
+    M_max: int = 1024
     use_batch_arrival: bool = True
     stochastic_duration: bool = True
     observation_noise: float = 0.15
