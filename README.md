@@ -1,146 +1,143 @@
 # HouseGym RL
 
-Deep reinforcement learning for post-disaster housing recovery scheduling.
+Reinforcement learning for post-disaster housing reconstruction scheduling.
 
-## Overview
+## Project Description
 
-This project applies reinforcement learning to optimize resource allocation in disaster recovery scenarios. Given limited construction workers and uncertain damage assessments, how should we schedule repairs across hundreds of damaged houses to maximize recovery speed while maintaining fairness?
+This project uses reinforcement learning to optimize how construction workers are assigned to damaged houses after a disaster. The core challenge: given limited workers and incomplete information about damage, how should we prioritize repairs to finish reconstruction as quickly and fairly as possible?
 
-**Problem characteristics:**
-- **Long-horizon decision-making**: 500-day episodes with sequential allocation
-- **Batch arrival**: Houses revealed in stages as damage assessments complete
-- **Resource constraints**: Limited workers with noisy capacity estimates
-- **Multi-objective**: Balance completion speed, fairness, and queue management
+**Key challenges:**
+- **Sequential decisions over time**: Each day, decide which houses get workers (500-day episodes)
+- **Incomplete information**: Houses are discovered gradually as damage assessments complete
+- **Limited resources**: Fixed number of workers, noisy capacity estimates
+- **Multiple goals**: Fast completion, short wait times, fair treatment
 
-**Dataset**: Real-world Lombok earthquake (Indonesia) reconstruction data
-- 300+ houses across 7 administrative regions
-- ~372,000 total man-days of construction work
-- Historical completion data for validation
+**Method**: Proximal Policy Optimization (PPO) trained on synthetic scenarios for robustness.
+
+## Dataset
+
+Based on the 2018 Lombok earthquake (Indonesia) reconstruction data.
+
+| Split | Source | Description |
+|-------|--------|-------------|
+| **Training** | 180 synthetic scenarios | Generated from 3 damage distribution families (major-dominant, balanced, minor-dominant) with randomized house counts and worker ratios |
+| **Testing** | 7 real Lombok regions | Mataram, West/North/Central/East Lombok, West Sumbawa, Sumbawa |
+
+Each region has:
+- 3 damage levels: Minor, Moderate, Major
+- Different damage distributions and contractor counts
+- Used for evaluating generalization to unseen scenarios
 
 ## Project Structure
 
 ```
 housegym_rl/
-├── README.md              # This file
-├── data/                  # Shared datasets
-│   └── lombok_data.pkl   # Lombok earthquake reconstruction data
-│
-├── sac/                   # Soft Actor-Critic implementation
-│   ├── src/              # SAC training and evaluation code
-│   ├── scripts/          # SLURM scripts for HiPerGator
-│   ├── docs/             # SAC-specific documentation
-│   ├── models/           # Trained SAC models
-│   ├── runs/             # TensorBoard logs
-│   ├── results/          # Evaluation results
-│   └── README_SAC.md     # Detailed SAC documentation
-│
-└── ppo/                   # Proximal Policy Optimization implementation (current)
-    ├── src/              # PPO training and evaluation code
-    ├── scripts/          # SLURM scripts for HiPerGator
-    ├── configs/          # Training configurations
-    ├── notebooks/        # Jupyter notebooks for demos
-    ├── docs/             # PPO-specific documentation
-    └── README.md         # Detailed PPO documentation
+├── README.md
+├── data/
+│   └── lombok_data.pkl       # Lombok earthquake reconstruction data
+├── demo/
+│   └── demo_notebook.ipynb   # Interactive demonstration
+└── src/
+    ├── housegymrl.py         # Environment classes
+    ├── main_ppo.py           # Training script
+    ├── evaluate_ppo.py       # Evaluation script
+    ├── baseline.py           # Baseline policies (LJF, SJF, Random)
+    ├── config.py             # Configuration constants
+    ├── ppo_configs.py        # PPO hyperparameters
+    └── synthetic_scenarios.py # Training data generator
 ```
 
 ## Quick Start
 
-### SAC (Legacy Implementation)
+### Demo Notebook
 
-For the original Soft Actor-Critic implementation:
-- See [sac/README_SAC.md](sac/README_SAC.md) for complete documentation
-- Trained models available in [sac/models/](sac/models/)
-- Results and analysis in [sac/results/](sac/results/)
-
-### PPO (Current Implementation)
-
-For the latest Proximal Policy Optimization implementation:
-- See [ppo/README.md](ppo/README.md) for complete documentation
-- Training scripts in [ppo/scripts/](ppo/scripts/)
-- Demo notebooks in [ppo/notebooks/](ppo/notebooks/)
-
-**Recommended for new work**: Use the PPO implementation, as it has better stability and is actively maintained.
-
-## Why Two Implementations?
-
-This project initially used **SAC (Soft Actor-Critic)**, an off-policy algorithm well-suited for continuous action spaces. However, we later migrated to **PPO (Proximal Policy Optimization)** for several reasons:
-
-1. **Stability**: PPO's clipped objective provides more stable training
-2. **Sample efficiency**: On-policy training better fits our episodic problem structure
-3. **CPU-friendly**: PPO performs well on CPU clusters, better suited for HiPerGator
-4. **Hyperparameter robustness**: PPO is less sensitive to hyperparameter choices
-
-Both implementations are preserved for:
-- **Comparison**: Benchmark different RL algorithms on the same problem
-- **Research**: Study algorithm-specific behaviors on disaster recovery scheduling
-- **Reproducibility**: All published results remain accessible
-
-## Key Features
-
-### Environment Design
-
-- **Daily batch decision framework**: Allocate workers across all houses each day
-- **Top-M observation pruning**: Focus on most critical houses using softmax priorities
-- **Hybrid weighted allocation**: Convert RL actions to feasible allocations with capacity constraints
-- **Realistic uncertainty**: Observation noise, capacity fluctuations, stochastic work progress
-
-### Reward Function V2.1
-
-```python
-# Three-component reward architecture
-progress_reward = (houses_completed_today / total_revealed) × 1.0
-completion_reward = (total_completed / total_revealed) × 1.0
-queue_penalty = sigmoid_penalty(waiting_times) × 0.1  # capped at -5.0
-
-reward = (progress + completion + queue_penalty) × 100
-```
-
-### Baseline Comparison
-
-- **Longest Job First (LJF)**: Prioritize most difficult houses
-- **Shortest Job First (SJF)**: Maximize completion count
-- **Random**: Unbiased baseline
-- **RL (SAC/PPO)**: Learned adaptive strategy
-
-## Development
-
-### Running Tests
-```bash
-# SAC tests
-cd sac/src
-python test_hybrid_allocation.py
-
-# PPO tests
-cd ppo/src
-python -m pytest tests/
-```
-
-### HiPerGator Training
+The easiest way to understand the project is to run the demo notebook:
 
 ```bash
-# SAC training
-cd sac
-sbatch scripts/train.slurm
+cd demo
+jupyter notebook demo_notebook.ipynb
+```
 
-# PPO training
-cd ppo
-sbatch scripts/train.slurm
+The notebook walks through:
+1. **Environment setup**: Create an environment and visualize the observation space
+2. **Single episode rollout**: Run one episode and plot the completion curve over time
+3. **Baseline comparison**: Compare LJF, SJF, and Random policies on the same scenario
+4. **Trained agent evaluation**: Load a trained PPO model and compare against baselines
+
+Running the full notebook takes about 5 minutes and produces plots showing how different policies perform.
+
+### Installation
+
+```bash
+git clone <repository-url>
+cd housegym_rl
+pip install numpy pandas gymnasium stable-baselines3 tensorboard
+```
+
+### Training
+
+```bash
+cd src
+
+# Single-region training (quick test)
+python main_ppo.py --experiment-name test_run --timesteps 100000
+
+# Multi-scenario training (recommended)
+python main_ppo.py --experiment-name robust_agent --use-synthetic --timesteps 2000000
+```
+
+**Training arguments:**
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--experiment-name` | required | Name for saving outputs |
+| `--timesteps` | 1,000,000 | Total training steps |
+| `--n-envs` | 16 | Parallel environments |
+| `--use-synthetic` | False | Train on 180 synthetic scenarios |
+
+### Evaluation
+
+```bash
+python evaluate_ppo.py \
+    --checkpoint-dir runs/my_experiment \
+    --test-regions Mataram Sumbawa "Central Lombok" \
+    --crew-levels 0.3 0.5 0.7 1.0 \
+    --compare-baselines
 ```
 
 ### Monitoring
 
 ```bash
-# TensorBoard (SAC)
-tensorboard --logdir sac/runs/
-
-# TensorBoard (PPO)
-tensorboard --logdir ppo/runs/
+tensorboard --logdir runs/
 ```
 
-## Citation
+Key metrics:
+- `rollout/ep_rew_mean`: Episode reward (should increase)
+- `train/clip_fraction`: Policy change per update (target: 0.1-0.2)
+- `train/entropy_loss`: Exploration level (should stay above -3)
 
-Based on Lombok earthquake reconstruction data. Research code for disaster recovery optimization using deep reinforcement learning.
+## Environment Overview
 
-## Contact
+The `RLEnv` simulates daily worker allocation:
 
-For questions or collaboration, please open an issue on GitHub.
+1. **Observation** (6150 dimensions):
+   - 6 global features: day, capacity, queue size, etc.
+   - 1024 × 6 candidate features: remaining work, waiting time, damage level, etc.
+
+2. **Action** (1024 dimensions):
+   - Priority score for each candidate house
+   - Converted to worker assignments via softmax
+
+3. **Reward**:
+   - Work progress (main signal)
+   - Completion bonus (houses finished)
+   - Queue penalty (waiting time)
+
+## Baselines
+
+| Policy | Strategy |
+|--------|----------|
+| LJF | Longest Job First - prioritize hardest jobs |
+| SJF | Shortest Job First - maximize completions |
+| Random | Random assignment |
+| Oracle | Full visibility (upper bound) |
