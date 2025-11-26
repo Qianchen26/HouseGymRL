@@ -1,19 +1,14 @@
 """
 Baseline Policies for House Reconstruction Scheduling
-=====================================================
 
-This module provides baseline policies and utilities for comparison with RL.
-
-Key Baselines:
+Provides baseline policies for comparison with RL:
 - LJF (Longest Job First): Prioritizes houses with longest total work
 - SJF (Shortest Job First): Prioritizes houses with shortest total work
 - Random: Random prioritization
 - Oracle-LJF/SJF: Same policies but with full queue visibility (no M limit)
 
-Design Philosophy:
-- These are fixed policies that cannot adapt
-- They serve to identify failure modes
-- The goal is NOT to beat them everywhere, but to be robust across scenarios
+These fixed policies serve to identify failure modes. The goal is not to beat
+them everywhere, but to be robust across different scenarios.
 """
 
 from __future__ import annotations
@@ -27,10 +22,6 @@ from housegymrl import BaselineEnv, OracleEnv, HousegymRLENV
 import config
 from config import CROSS_AVAILABILITY_SCENARIOS
 
-
-# ============================================================================
-# Baseline Environment Creation
-# ============================================================================
 
 def create_baseline_env(
     region_key: str,
@@ -95,10 +86,6 @@ def create_oracle_env(
         seed=seed,
     )
 
-
-# ============================================================================
-# Baseline Rollout Functions
-# ============================================================================
 
 def run_baseline_rollout(
     env: BaselineEnv,
@@ -232,10 +219,6 @@ def compare_baselines(
     return df
 
 
-# ============================================================================
-# Cross-Availability Testing
-# ============================================================================
-
 def test_baseline_robustness(
     policy: str,
     region_key: str,
@@ -292,10 +275,6 @@ def test_baseline_robustness(
     return df
 
 
-# ============================================================================
-# Legacy Support
-# ============================================================================
-
 def make_baseline_scores(env: HousegymRLENV, policy: str = "SJF") -> np.ndarray:
     """
     Legacy function for backward compatibility.
@@ -342,10 +321,6 @@ def make_baseline_scores(env: HousegymRLENV, policy: str = "SJF") -> np.ndarray:
 
     return np.clip(np.nan_to_num(scores, nan=0.0), 0.0, None)
 
-
-# ============================================================================
-# Main Demo
-# ============================================================================
 
 if __name__ == "__main__":
     """Demo: Compare baselines on Mataram region."""

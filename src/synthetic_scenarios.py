@@ -1,14 +1,16 @@
-"""Utility for generating structured synthetic damage scenarios.
+"""
+Synthetic Scenario Generator
 
-Three scenario families are supported:
-1. Major-dominant
-2. Balanced
-3. Minor-dominant
+Generates structured synthetic damage scenarios for robustness training.
+
+Scenario families:
+- Major-dominant: High proportion of severely damaged houses
+- Balanced: Even distribution across damage levels
+- Minor-dominant: High proportion of lightly damaged houses
 
 Each family produces 50 standard samples (light jitter) plus 10 extreme
-variants (strong bias + different crew ratios). Results can be exported to a
-CSV file and/or registered with the global REGION_CONFIG via
-``config.register_synthetic_region``.
+variants (strong bias + different crew ratios). Scenarios can be registered
+with REGION_CONFIG via config.register_synthetic_region().
 """
 
 from __future__ import annotations

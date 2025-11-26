@@ -1,18 +1,24 @@
 """
-HouseGym RL Environment - Enhanced Version
-==========================================
+HouseGym RL Environment
 
-Core Design Principles:
-1. Top-M by waiting time (surface longest-waiting houses)
-2. Batch arrival system (simulates real assessment timeline)
-3. Capacity ramp system (simulates contractor mobilization)
-4. Focus on robustness and generalization, not peak performance
+Simulates post-disaster housing reconstruction scheduling.
+
+Classes:
+    - BaseEnv: Base class with all common constraints
+    - RLEnv: For RL training (continuous action space)
+    - BaselineEnv: For baseline policies (LJF/SJF/Random)
+    - OracleEnv: No candidate limit (quantifies information cost)
+
+Design Principles:
+    - Top-M selection by waiting time (fairness-first visibility)
+    - Batch arrival system (simulates real assessment timeline)
+    - Stochastic work progress and observation noise (robustness)
 
 Architecture:
-- BaseEnv: Base class with all common constraints
-- RLEnv: For RL training (continuous action space)
-- BaselineEnv: For baseline policies (LJF/SJF/Random)
-- OracleEnv: No candidate limit (quantifies information cost)
+    Houses arrive in batches, enter a waiting queue, and are surfaced as
+    candidates based on waiting time. The agent allocates contractors to
+    candidates, respecting per-house capacity limits (cmax). Work progresses
+    stochastically until completion.
 """
 
 from __future__ import annotations
@@ -38,10 +44,6 @@ from config import (
     CMAX_BY_LEVEL,
     DATA_DIR
 )
-
-# ============================================================================
-# Auxiliary Classes
-# ============================================================================
 
 class TrueBatchArrival:
     """
@@ -102,32 +104,15 @@ class TrueBatchArrival:
         self.schedule = schedule
 
     def step_to_day(self, day: int) -> List[int]:
-        """
-        Advance to given day and return newly revealed houses.
-        
-        Debug: Track revealed_ids updates
-        """
+        """Advance to given day and return newly revealed houses."""
         new_arrivals = []
 
-        # Check all scheduled days up to current day
         for scheduled_day, houses in self.schedule.items():
             if scheduled_day <= day and scheduled_day > self.current_day:
-                # Debug: print what's happening
-                # if len(houses) > 0:
-                #     print(f"    [DEBUG] Day {day}: Batch at day {scheduled_day} releasing {len(houses)} houses")
-                #     print(f"            Before: revealed_ids has {len(self.revealed_ids)} houses")
-
                 new_arrivals.extend(houses)
                 self.revealed_ids.update(houses)
 
-                # if len(houses) > 0:
-                #     print(f"            After:  revealed_ids has {len(self.revealed_ids)} houses")
-
         self.current_day = day
-
-        # if len(new_arrivals) > 0:
-        #     print(f"    [DEBUG] Day {day}: Total new arrivals = {len(new_arrivals)}, revealed_ids total = {len(self.revealed_ids)}")
-        
         return new_arrivals
 
     def is_complete(self) -> bool:
@@ -165,13 +150,15 @@ class StaticArrival:
 
 class CapacityRamp:
     """
-    Models gradual contractor mobilization.
-    Capacity grows from 0 to max over time.
+    Models gradual contractor mobilization (disabled by default).
 
-    Based on Lombok reality:
+    Capacity grows from 0 to max over time. Based on Lombok reality:
     - Days 0-36: Planning phase (K=0)
     - Days 36-216: Linear ramp-up
     - Day 216+: Full capacity
+
+    Note: Controlled by CAPACITY_RAMP_ENABLED in config.py. Currently disabled
+    in favor of FixedCapacity for simpler training dynamics.
     """
 
     def __init__(self, max_capacity: int, config: dict):
@@ -247,10 +234,6 @@ class WaitingQueue:
         """Get current queue size."""
         return len(self.waiting_ids)
 
-
-# ============================================================================
-# Base Environment Class
-# ============================================================================
 
 class BaseEnv(gym.Env):
     """
@@ -338,7 +321,7 @@ class BaseEnv(gym.Env):
         self._arr_cmax = self.tasks_df['cmax_per_day'].values.astype(np.float32)
         self.capacity_ceiling = int(self.M_max * float(self._arr_cmax.max()))
 
-        # Fix Critical Issue #3: Compute fixed total work for consistent reward scaling
+        # Total work across all houses (fixed denominator for reward scaling)
         self._total_work_all = float(sum(self._arr_total))
 
         # Initialize systems
@@ -487,12 +470,6 @@ class BaseEnv(gym.Env):
             base_capacity = min(base_capacity, self.capacity_ceiling)
         return max(0, base_capacity)
 
-    def _effective_capacity(self) -> int:
-        """
-        Return the capacity sampled for the current day (for logging).
-        """
-        return self.current_day_capacity
-
     def _begin_day_if_needed(self) -> None:
         """Initialize per-day state if we are starting a new day."""
         # Only initialize if we don't already have candidates for today
@@ -586,7 +563,7 @@ class BaseEnv(gym.Env):
                 # Do not exceed remaining work
                 actual_progress = min(actual_progress, self._arr_rem[house_id])
             else:
-                # Deterministic progress (legacy mode)
+                # Deterministic progress
                 actual_progress = min(workers, self._arr_rem[house_id])
 
             # Update remaining work
@@ -595,17 +572,12 @@ class BaseEnv(gym.Env):
 
     def _calculate_reward(self) -> Dict[str, float]:
         """
-        Calculate reward with action-dependent progress (Reward V3).
+        Calculate multi-component reward signal.
 
         Components:
-        1. Progress: Work amount completed this step (action-dependent, continuous)
-        2. Completion Bonus: Houses finished this step (sparse reward)
-        3. Queue Penalty: Average waiting time (linear, avoids saturation)
-
-        Key improvements over V2.1:
-        - Progress is now based on work amount (∂r/∂a ≠ 0), not house count
-        - Queue penalty uses average waiting time (no longer saturates at -5)
-        - Adjusted weights to emphasize action-dependent signals
+        1. Progress: Work amount completed this step (action-dependent)
+        2. Completion Bonus: Houses finished this step (sparse)
+        3. Queue Penalty: Average waiting time (capped to avoid saturation)
 
         Returns:
             Dictionary with individual components and total scaled reward
@@ -613,27 +585,22 @@ class BaseEnv(gym.Env):
         revealed_ids = list(self.arrival_system.revealed_ids)
         num_revealed = len(revealed_ids)
 
-        # Component 1: Action-Dependent Progress (工作量进度)
-        # Calculate actual work completed this step (continuous, action-dependent)
+        # Component 1: Work Progress (action-dependent)
         work_completed_this_step = 0.0
         for house_id in revealed_ids:
-            # Work done = reduction in remaining work
             work_diff = float(self.last_arr_rem[house_id]) - float(self._arr_rem[house_id])
             work_done = max(0.0, work_diff)
             work_completed_this_step += work_done
 
-        # Fix Critical Issue #3: Use fixed denominator to maintain temporal consistency
-        # Previously used sum(revealed_ids) which changed with batch arrival
+        # Use fixed denominator (total work) for temporal consistency
         progress_reward = float(work_completed_this_step / self._total_work_all if self._total_work_all > 0 else 0.0)
 
-        # Component 2: Completion Bonus (完成房屋奖励)
-        # Sparse bonus for finishing houses (secondary signal)
+        # Component 2: Completion Bonus (sparse signal for finishing houses)
         current_completed = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
         new_completed = max(0, current_completed - self.last_completion_count)
         completion_bonus = float(new_completed / num_revealed if num_revealed > 0 else 0.0)
 
-        # Component 3: Queue Penalty (队列惩罚 - 修复饱和问题)
-        # Use average waiting time to avoid saturation
+        # Component 3: Queue Penalty (average waiting time, capped to avoid saturation)
         queue_size = self.waiting_queue.size()
         if queue_size > 0:
             waiting_times = [self.waiting_time[h] for h in self.waiting_queue.get_all()]
@@ -782,18 +749,6 @@ class BaseEnv(gym.Env):
         Returns:
             Standard gym step outputs
         """
-        # ===== 新增：Debug allocation =====
-        # if self.day % 10 == 0 or self.day in [37, 38, 39, 40]:
-        #     print(f"    [ALLOCATION DEBUG] Day {self.day}:")
-        #     print(f"      Allocation dict size: {len(allocation)}")
-        #     if len(allocation) > 0:
-        #         total_workers = sum(allocation.values())
-        #         print(f"      Total workers allocated: {total_workers}")
-        #         print(f"      Sample allocations: {list(allocation.items())[:3]}")
-        #     else:
-        #         print(f"      ⚠️  Allocation is EMPTY!")
-        # ==================================
-
         # Update tracking metrics BEFORE applying work
         self.last_queue_size = self.waiting_queue.size()
         self.last_workers_used = sum(allocation.values()) if allocation else 0
@@ -822,23 +777,11 @@ class BaseEnv(gym.Env):
         # Calculate completion (only for revealed houses)
         revealed_ids = list(self.arrival_system.revealed_ids)
 
-        # Debug: track completion calculation
-        # if self.day % 50 == 0 or self.day < 40:
-        #     print(f"    [DEBUG] Day {self.day}: Calculating completion...")
-        #     print(f"            revealed_ids length: {len(revealed_ids)}")
-        #     if len(revealed_ids) > 0:
-        #         completed_count = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
-        #         print(f"            completed houses: {completed_count}")
-        #         print(f"            completion: {completed_count / len(revealed_ids):.3f}")
-
         if len(revealed_ids) > 0:
-            # Count completed houses
             revealed_completed = sum(1 for h in revealed_ids if self._arr_rem[h] <= 0)
             completion = revealed_completed / len(revealed_ids)
         else:
             completion = 0.0
-            # if self.day % 50 == 0:
-            #     print(f"            WARNING: revealed_ids is empty at day {self.day}!")
 
         # Calculate reward using new four-component reward function
         reward_dict = self._calculate_reward()
@@ -972,7 +915,7 @@ class BaseEnv(gym.Env):
                 self.seed if self.seed is not None else 42
             )
         elif isinstance(self.arrival_system, StaticArrival):
-            # Fix Critical Issue #1: Reset StaticArrival to avoid empty queue on second episode
+            # Recreate StaticArrival to ensure queue is populated on each episode
             self.arrival_system = StaticArrival(self.tasks_df)
 
         self.waiting_queue = WaitingQueue()
@@ -992,17 +935,8 @@ class BaseEnv(gym.Env):
 
         # Initial batch arrival
         initial_arrivals = self.arrival_system.step_to_day(0)
-
-        # ===== 新增：Debug =====
-        # print(f"[RESET DEBUG] Initial arrivals from arrival_system: {len(initial_arrivals)} houses")
-        # print(f"[RESET DEBUG] Queue size before add: {self.waiting_queue.size()}")
-        # =======================
-
         if initial_arrivals:
             self.waiting_queue.add(initial_arrivals)
-
-        # ===== 新增：Debug =====
-        # print(f"[RESET DEBUG] Queue size after add: {self.waiting_queue.size()}")
 
         # Prepare the first day so observations reflect valid candidates
         self._begin_day_if_needed()
@@ -1020,10 +954,6 @@ class BaseEnv(gym.Env):
 
         return obs, info
 
-
-# ============================================================================
-# Environment Subclasses
-# ============================================================================
 
 class RLEnv(BaseEnv):
     """
@@ -1069,7 +999,7 @@ class RLEnv(BaseEnv):
             for i in range(M)
         ], dtype=np.float64)
 
-        # Fix Critical Issue #2: Get remaining work for each candidate
+        # Remaining work per candidate (prevents over-allocation to nearly-done houses)
         remaining_work_array = np.array([
             self._arr_rem[candidates[i]]
             for i in range(M)
@@ -1334,15 +1264,8 @@ class OracleEnv(BaseEnv):
         return allocation
 
 
-# ============================================================================
-# Legacy Support
-# ============================================================================
-
 class HousegymRLENV(RLEnv):
-    """
-    Legacy class for backward compatibility.
-    Deprecated - use RLEnv instead.
-    """
+    """Deprecated compatibility wrapper. Use RLEnv instead."""
 
     def __init__(self, *args, **kwargs):
         warnings.warn(

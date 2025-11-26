@@ -1,15 +1,13 @@
 """
-PPO training script for HouseGym RL.
+PPO Training Script for HouseGym RL
 
-This script trains a PPO agent on the disaster recovery scheduling problem.
-All critical bugs from the SAC version have been fixed:
-1. StaticArrival reset bug
-2. Allocation ignoring remaining_work
-3. Progress reward dynamic denominator
-4. VecNormalize save/load path inconsistency
+Trains a PPO agent on the disaster recovery scheduling problem using
+Stable-Baselines3. Supports multi-scenario training via synthetic data,
+parallel environments, and VecNormalize for observation/reward scaling.
 
 Usage:
     python main_ppo.py --experiment-name my_experiment --timesteps 500000
+    python main_ppo.py --use-synthetic --timesteps 2000000
 """
 
 import argparse
@@ -37,10 +35,6 @@ from housegymrl import RLEnv
 from ppo_configs import PPOConfig, TrainingConfig, EnvironmentConfig
 from synthetic_scenarios import generate_scenarios, register_dataframe
 
-
-# ============================================================================
-# Progress Callback for SLURM
-# ============================================================================
 
 class ProgressCallback(BaseCallback):
     """Custom callback to print training progress in SLURM logs and ensure TensorBoard flush."""

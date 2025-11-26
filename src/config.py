@@ -1,3 +1,13 @@
+"""
+Configuration for HouseGym RL Environment
+
+Contains all constants and parameters for:
+- Work duration and crew limits per damage level
+- Batch arrival and capacity ramp schedules
+- Region data (Lombok earthquake)
+- Evaluation settings
+"""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -13,9 +23,6 @@ WORK_PARAMS = {
 # Per-household daily crew cap by damage level
 CMAX_BY_LEVEL = {0: 2, 1: 4, 2: 6}
 
-# ============================================================================
-# Batch Arrival + Capacity Ramp Configuration
-# ============================================================================
 COMBINED_ARRIVAL_CAPACITY_CONFIG = {
     # Batch arrival: Houses revealed over time
     "batch_arrival": {
@@ -31,12 +38,9 @@ COMBINED_ARRIVAL_CAPACITY_CONFIG = {
     }
 }
 
-# Temporary switch: disable capacity ramp (forces fixed capacity even if configs exist)
+# Disable capacity ramp (forces fixed capacity for simpler training dynamics)
 CAPACITY_RAMP_ENABLED = False
 
-# ============================================================================
-# Candidate Selection Strategy
-# ============================================================================
 # Candidate selection strategy: longest-waiting Top-M
 CANDIDATE_SELECTION = "longest_wait"
 
@@ -49,9 +53,6 @@ OBS_G = 6  # Global features (day, capacity, queue_size, etc.)
 OBS_F = 6
 EXPECTED_OBS_DIM = OBS_G + M_FIXED * OBS_F  # 6 + 1024*6 = 6150 dimensions
 
-# ============================================================================
-# Cross-availability configuration
-# ============================================================================
 CREW_AVAILABILITY_LEVELS = [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
 # Region configuration (counts follow v5 reference; seeds default to 42)
@@ -78,18 +79,14 @@ for region_name, config in REGION_CONFIG.items():
             "scenario_id": f"{region_name}_av{availability:.1f}"
         })
 
-# Output directory (基础目录，不包含时间戳)
+# Output directories (without timestamp)
 OUTPUT_BASE_DIR = Path("output")
-OUTPUT_DIR = OUTPUT_BASE_DIR / "default"  # 默认目录
+OUTPUT_DIR = OUTPUT_BASE_DIR / "default"
 FIG_DIR = OUTPUT_DIR / "fig"
 TAB_DIR = OUTPUT_DIR / "tab"
 
-# 确保基础目录存在
 OUTPUT_BASE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ============================================================================
-# Evaluation Configuration
-# ============================================================================
 EVAL_SEED = 42
 AUC_TIME_POINTS = [200, 300]
 MAKESPAN_THRESHOLD = 1.0
@@ -124,13 +121,10 @@ GENERALIZATION_CONFIG = {
 }
 
 # Data location
-# Point to project root data directory (from ppo/src/ -> housegymrl/data/)
-DATA_DIR = Path(__file__).parent.parent.parent / "data"
+DATA_DIR = Path(__file__).parent.parent / "data"
 OBSERVED_DATA_PATH = DATA_DIR / "lombok_data.pkl"
 
-# ============================================================================
-# Support for Synthetic Scenarios
-# ============================================================================
+
 def register_synthetic_region(
     H: int,
     K: int,

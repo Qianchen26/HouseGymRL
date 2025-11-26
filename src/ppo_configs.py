@@ -1,8 +1,8 @@
 """
-PPO hyperparameter configurations for HouseGym RL.
+PPO Hyperparameter Configurations
 
-This module defines standard PPO configurations for different experimental scenarios.
-All configurations use fixed M=512 to avoid variable observation dimensions.
+Defines PPO configurations for different experimental scenarios.
+All configurations use fixed M=1024 to avoid variable observation dimensions.
 """
 
 from dataclasses import dataclass

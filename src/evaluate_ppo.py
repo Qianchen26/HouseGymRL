@@ -1,5 +1,5 @@
 """
-PPO model evaluation script for HouseGym RL.
+PPO Model Evaluation Script
 
 Evaluates trained PPO models across multiple test regions, crew levels, and seeds.
 Compares PPO performance against baselines (LJF, SJF, Random).
