@@ -21,7 +21,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 sys.path.insert(0, str(Path(__file__).parent))
 
 from housegymrl import RLEnv, BaselineEnv
-from config import REGION_CONFIG
+from config import REGION_CONFIG, MAX_STEPS
 
 
 def load_model_and_vecnorm(checkpoint_dir: str) -> Tuple[PPO, VecNormalize]:
@@ -93,7 +93,9 @@ def evaluate_on_scenario(
         - completion_rate: float (fraction of houses completed)
         - avg_queue_time: float (average waiting days)
         - episode_reward: float (total episode reward)
-        - episode_length: int (number of steps taken)
+        - total_completion_days: int (days to complete all houses)
+        - num_contractors: int (actual contractor count used)
+        - day1, day2, ...: float (completion rate at each day)
 
     Example:
         >>> results = evaluate_on_scenario(model, vec_norm, "Mataram", 0.5, n_seeds=5)
@@ -124,30 +126,46 @@ def evaluate_on_scenario(
         vec_env = VecNormalize(vec_env, training=False, norm_obs=True, norm_reward=False)
         vec_env.obs_rms = vec_norm.obs_rms  # Use training normalization stats
 
-        # Run episode
+        # Run episode and track daily completion
         obs = vec_env.reset()
         done = False
         episode_reward = 0.0
         step_count = 0
+        completion_history = []  # Track completion rate at each day
 
         while not done:
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, info = vec_env.step(action)
             episode_reward += reward[0]
             step_count += 1
+            # Record completion rate for this day
+            daily_completion = info[0].get('completion_rate', 0.0)
+            completion_history.append(daily_completion)
 
         # Extract metrics from final info
         final_info = info[0]
         completion_rate = final_info.get('completion_rate', 0.0)
         avg_queue_time = final_info.get('avg_queue_time', 0.0)
 
-        results.append({
+        # Pad completion_history to MAX_STEPS with final completion rate
+        final_rate = completion_history[-1] if completion_history else 0.0
+        while len(completion_history) < MAX_STEPS:
+            completion_history.append(final_rate)
+
+        # Build result row with daily completion columns
+        row = {
             'seed': seed,
             'completion_rate': completion_rate,
             'avg_queue_time': avg_queue_time,
             'episode_reward': episode_reward,
-            'episode_length': step_count,
-        })
+            'total_completion_days': step_count,
+            'num_contractors': num_contractors,
+        }
+        # Add daily completion columns (day1, day2, ..., day500)
+        for day_idx, comp in enumerate(completion_history, start=1):
+            row[f'day{day_idx}'] = comp
+
+        results.append(row)
 
         vec_env.close()
 
@@ -172,14 +190,16 @@ def evaluate_cross_scenarios(
         n_seeds: Number of seeds per scenario (integer).
 
     Returns:
-        DataFrame with shape (n_regions × n_crew_levels × n_seeds, 7) and columns:
+        DataFrame with columns:
         - region: string
         - crew_level: float
+        - num_contractors: int (actual contractor count)
         - seed: int
         - completion_rate: float
         - avg_queue_time: float
         - episode_reward: float
-        - episode_length: int
+        - total_completion_days: int
+        - day1, day2, ...: float (completion rate at each day)
 
     Example:
         >>> results = evaluate_cross_scenarios(
@@ -212,10 +232,12 @@ def evaluate_cross_scenarios(
 
     combined = pd.concat(all_results, ignore_index=True)
 
-    # Reorder columns
-    cols = ['region', 'crew_level', 'seed', 'completion_rate',
-            'avg_queue_time', 'episode_reward', 'episode_length']
-    combined = combined[cols]
+    # Reorder columns: fixed columns first, then day columns in order
+    fixed_cols = ['region', 'crew_level', 'num_contractors', 'seed', 'completion_rate',
+                  'avg_queue_time', 'episode_reward', 'total_completion_days']
+    day_cols = sorted([c for c in combined.columns if c.startswith('day')],
+                      key=lambda x: int(x[3:]))  # Sort by day number
+    combined = combined[fixed_cols + day_cols]
 
     return combined
 
@@ -257,6 +279,7 @@ def run_baseline(
         done = False
         episode_reward = 0.0
         step_count = 0
+        completion_history = []  # Track completion rate at each day
 
         while not done:
             action = env.action_space.sample()  # Baseline doesn't use action
@@ -264,14 +287,29 @@ def run_baseline(
             done = terminated or truncated
             episode_reward += reward
             step_count += 1
+            # Record completion rate for this day
+            daily_completion = info.get('completion_rate', 0.0)
+            completion_history.append(daily_completion)
 
-        results.append({
+        # Pad completion_history to MAX_STEPS with final completion rate
+        final_rate = completion_history[-1] if completion_history else 0.0
+        while len(completion_history) < MAX_STEPS:
+            completion_history.append(final_rate)
+
+        # Build result row with daily completion columns
+        row = {
             'seed': seed,
             'completion_rate': info.get('completion_rate', 0.0),
             'avg_queue_time': info.get('avg_queue_time', 0.0),
             'episode_reward': episode_reward,
-            'episode_length': step_count,
-        })
+            'total_completion_days': step_count,
+            'num_contractors': num_contractors,
+        }
+        # Add daily completion columns (day1, day2, ..., day500)
+        for day_idx, comp in enumerate(completion_history, start=1):
+            row[f'day{day_idx}'] = comp
+
+        results.append(row)
 
     return pd.DataFrame(results)
 
@@ -294,8 +332,11 @@ def main():
         "--test-regions",
         type=str,
         nargs="+",
-        default=["Mataram", "Sumbawa", "Central Lombok"],
-        help="Test region names",
+        default=[
+            "Mataram", "West Lombok", "North Lombok", "Central Lombok",
+            "East Lombok", "West Sumbawa", "Sumbawa"
+        ],
+        help="Test region names (all 7 Lombok regions by default)",
     )
 
     parser.add_argument(
@@ -321,9 +362,9 @@ def main():
     )
 
     parser.add_argument(
-        "--compare-baselines",
+        "--ppo-only",
         action="store_true",
-        help="Also evaluate baselines (LJF, SJF) for comparison",
+        help="Only evaluate PPO (skip baselines LJF, SJF)",
     )
 
     args = parser.parse_args()
@@ -355,28 +396,12 @@ def main():
 
     ppo_results['method'] = 'PPO'
 
-    # Save PPO results
-    ppo_file = output_dir / "evaluation_results.csv"
-    ppo_results.to_csv(ppo_file, index=False)
-    print(f"\nPPO results saved to: {ppo_file}")
+    # Collect all results (PPO + baselines)
+    all_results = [ppo_results]
 
-    # Print summary
-    summary = ppo_results.groupby(['region', 'crew_level']).agg({
-        'completion_rate': ['mean', 'std'],
-        'avg_queue_time': ['mean', 'std'],
-    }).round(3)
-
-    print("\n" + "="*80)
-    print("PPO EVALUATION SUMMARY")
-    print("="*80)
-    print(summary)
-    print("="*80 + "\n")
-
-    # Compare with baselines if requested
-    if args.compare_baselines:
-        print("\nRunning baseline comparisons...")
-
-        all_baseline_results = []
+    # Run baselines unless --ppo-only is specified
+    if not args.ppo_only:
+        print("\nRunning baseline comparisons (LJF, SJF)...")
 
         for policy in ["LJF", "SJF"]:
             for region in args.test_regions:
@@ -388,25 +413,44 @@ def main():
                     baseline_results['crew_level'] = crew_level
                     baseline_results['method'] = policy
 
-                    all_baseline_results.append(baseline_results)
+                    all_results.append(baseline_results)
 
-        baseline_combined = pd.concat(all_baseline_results, ignore_index=True)
+    # Combine all methods into single DataFrame
+    all_methods = pd.concat(all_results, ignore_index=True)
 
-        # Combine PPO and baselines
-        all_methods = pd.concat([ppo_results, baseline_combined], ignore_index=True)
-        all_methods_file = output_dir / "all_methods_comparison.csv"
-        all_methods.to_csv(all_methods_file, index=False)
+    # Reorder columns: fixed columns first, then day columns in order
+    fixed_cols = ['region', 'crew_level', 'num_contractors', 'seed', 'method',
+                  'completion_rate', 'avg_queue_time', 'episode_reward', 'total_completion_days']
+    day_cols = sorted([c for c in all_methods.columns if c.startswith('day')],
+                      key=lambda x: int(x[3:]))
+    all_methods = all_methods[fixed_cols + day_cols]
 
-        print(f"\nAll methods comparison saved to: {all_methods_file}")
+    # Save to single comprehensive CSV
+    output_file = output_dir / "all_methods_comparison.csv"
+    all_methods.to_csv(output_file, index=False)
+    print(f"\nResults saved to: {output_file}")
 
-        # Print comparison summary
-        comparison = all_methods.groupby(['method', 'region', 'crew_level'])['completion_rate'].mean().unstack(level=0)
+    # Print summary by method
+    print("\n" + "="*80)
+    print("EVALUATION SUMMARY")
+    print("="*80)
+
+    summary = all_methods.groupby(['method', 'region', 'crew_level', 'num_contractors']).agg({
+        'completion_rate': ['mean', 'std'],
+        'total_completion_days': ['mean', 'std'],
+        'avg_queue_time': ['mean', 'std'],
+    }).round(3)
+    print(summary)
+
+    # Print completion days comparison if baselines were run
+    if not args.ppo_only:
+        comparison = all_methods.groupby(['method', 'region', 'crew_level', 'num_contractors'])['total_completion_days'].mean().unstack(level=0)
         print("\n" + "="*80)
-        print("COMPLETION RATE COMPARISON (PPO vs Baselines)")
+        print("COMPLETION DAYS COMPARISON (PPO vs Baselines)")
         print("="*80)
-        print(comparison.round(3))
-        print("="*80 + "\n")
+        print(comparison.round(1))
 
+    print("="*80 + "\n")
     print("Evaluation completed!")
 
 
