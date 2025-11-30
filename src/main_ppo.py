@@ -267,11 +267,12 @@ def create_ppo_model(
     Example:
         >>> model = create_ppo_model(vec_env, PPO_DEFAULT, "runs/experiment1/tb_logs")
     """
-    # Larger network for 6150-dim input (default 64x64 is too small)
+    # Use MultiInputPolicy for Dict observation space
+    # Network architecture: [256, 256] handles Dict obs from environment
     policy_kwargs = dict(net_arch=[256, 256])
 
     model = PPO(
-        "MlpPolicy",
+        "MultiInputPolicy",  # Changed from MlpPolicy for Dict obs support
         vec_env,
         policy_kwargs=policy_kwargs,
         learning_rate=ppo_config.learning_rate,

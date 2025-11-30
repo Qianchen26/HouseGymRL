@@ -439,24 +439,39 @@ class BaseEnv(gym.Env):
         """
         Define observation and action spaces.
 
-        Uses M_max to ensure fixed space dimensions across episodes.
+        Step 1: Dict observation with padding and mask
+        Step 2: Learned heuristic (6-dimensional weight vector)
         """
-        # Observation: 6 global features + M_max*6 candidate features
-        # Candidate features: [remain, waiting_time, total_work, damage_level, cmax, mask]
-        candidate_feature_dim = 6
-        obs_dim = 6 + self.M_max * candidate_feature_dim
-        self.observation_space = spaces.Box(
-            low=0.0,
-            high=np.inf,
-            shape=(obs_dim,),
-            dtype=np.float32
-        )
+        # Observation: Dict with global features, candidate features, and mask
+        from config import MAX_QUEUE_SIZE, OBS_G, OBS_HOUSE_FEATURES, HEURISTIC_ACTION_DIM
 
-        # Action: one priority score per candidate
+        self.observation_space = spaces.Dict({
+            'global': spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(OBS_G,),  # 6 global features
+                dtype=np.float32
+            ),
+            'candidates': spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(MAX_QUEUE_SIZE, OBS_HOUSE_FEATURES),  # (1024, 6)
+                dtype=np.float32
+            ),
+            'mask': spaces.Box(
+                low=0,
+                high=1,
+                shape=(MAX_QUEUE_SIZE,),  # (1024,)
+                dtype=np.float32
+            )
+        })
+
+        # Action: learned heuristic weights (Step 2)
+        # 6-dimensional weight vector for scoring candidates
         self.action_space = spaces.Box(
             low=0.0,
             high=1.0,
-            shape=(self.M_max,),
+            shape=(HEURISTIC_ACTION_DIM,),  # 6 weights
             dtype=np.float32
         )
 
@@ -675,9 +690,10 @@ class BaseEnv(gym.Env):
 
         Each step processes an entire day:
         1. Begin new day (reveal new houses, sample candidates)
-        2. Get allocation from policy (RL or baseline)
-        3. Execute allocation and advance to next day
-        4. Return observation and reward
+        2. Build candidate snapshot (for consistent obs/allocation/reward)
+        3. Get allocation from policy (RL or baseline)
+        4. Execute allocation and advance to next day
+        5. Return observation and reward
 
         Args:
             action: Action from policy (or None for baseline)
@@ -687,6 +703,10 @@ class BaseEnv(gym.Env):
         """
         # Initialize a new day if needed
         self._begin_day_if_needed()
+
+        # Build candidate snapshot for this step (CRITICAL: must be first!)
+        # This ensures allocation, reward, and observation use the same candidate set
+        self._build_candidates_obs()
 
         # Get allocation for today
         if self.waiting_queue.size() == 0 or len(self.pending_candidates) == 0 or self.current_day_capacity <= 0:
@@ -828,15 +848,165 @@ class BaseEnv(gym.Env):
 
         return obs, reward, terminated, truncated, info
 
-    def _get_obs(self) -> np.ndarray:
+    def _build_candidates_obs(self) -> None:
         """
-        Build observation vector.
+        Construct normalized feature matrix and mask for candidate houses, then cache.
 
-        Structure:
-        - 6 global features
-        - M_max*6 candidate features (padded with zeros if M < M_max)
+        This function MUST be called at the beginning of each step() to ensure that
+        allocation, reward computation, and observation all use the same candidate snapshot.
+
+        Args:
+            None (uses self.pending_candidates from internal state)
+
+        Returns:
+            None (caches results in self._last_candidates_obs, self._last_mask, self._last_candidate_ids)
+
+        Requires:
+            - self.pending_candidates is populated (list of house IDs)
+            - len(self.pending_candidates) <= MAX_QUEUE_SIZE
+
+        Ensures:
+            - self._last_candidates_obs.shape == (MAX_QUEUE_SIZE, OBS_HOUSE_FEATURES)
+            - self._last_mask.shape == (MAX_QUEUE_SIZE,)
+            - self._last_mask[i] == 1.0 for i < len(candidate_ids), else 0.0
+            - All features are normalized using FEATURE_SCALES
+
+        Side effects:
+            - Sets self._last_candidates_obs
+            - Sets self._last_mask
+            - Sets self._last_candidate_ids
         """
-        # Global features
+        from config import MAX_QUEUE_SIZE, OBS_HOUSE_FEATURES, FEATURE_SCALES
+
+        # Get candidate house IDs (Step 1: still M=1024)
+        candidate_ids = self.pending_candidates if self.pending_candidates else []
+
+        N = len(candidate_ids)
+        assert N <= MAX_QUEUE_SIZE, f"Candidate pool exceeds MAX_QUEUE_SIZE: {N} > {MAX_QUEUE_SIZE}"
+
+        # Initialize padding arrays
+        candidates = np.zeros((MAX_QUEUE_SIZE, OBS_HOUSE_FEATURES), dtype=np.float32)
+        mask = np.zeros(MAX_QUEUE_SIZE, dtype=np.float32)
+
+        # Fill features for actual candidates (normalized for consistency with scoring)
+        for i, house_id in enumerate(candidate_ids):
+            if i >= MAX_QUEUE_SIZE:
+                break
+
+            # Extract raw features
+            # Get true remaining work with optional observation noise
+            true_remain = self._arr_rem[house_id]
+            if self.obs_noise > 0:
+                # Noisy observation: true_value + N(0, σ * true_value)
+                noise = self.rng.normal(0, true_remain * self.obs_noise)
+                observed_remain = max(0, true_remain + noise)
+            else:
+                observed_remain = true_remain
+
+            waiting_time = float(self.waiting_time[house_id])
+            total_work = float(self._arr_total[house_id])
+            damage_level = float(self._arr_dmg[house_id])
+            cmax = float(self._arr_cmax[house_id])
+
+            # Normalize using FEATURE_SCALES from config
+            candidates[i] = [
+                observed_remain / FEATURE_SCALES[0],  # Remaining work (scale: 100)
+                waiting_time / FEATURE_SCALES[1],     # Days waiting (scale: 100)
+                total_work / FEATURE_SCALES[2],       # Total workload (scale: 100)
+                damage_level / FEATURE_SCALES[3],     # Severity 0-2 (scale: 2)
+                cmax / FEATURE_SCALES[4],             # Max daily capacity (scale: 10)
+                1.0                                    # Bias term (always 1.0)
+            ]
+            mask[i] = 1.0  # Mark as valid candidate
+
+        # Cache for use in scoring and observation
+        self._last_candidates_obs = candidates
+        self._last_mask = mask
+        self._last_candidate_ids = candidate_ids
+
+        # Postcondition checks
+        assert self._last_candidates_obs.shape == (MAX_QUEUE_SIZE, OBS_HOUSE_FEATURES)
+        assert self._last_mask.shape == (MAX_QUEUE_SIZE,)
+        assert np.sum(self._last_mask) == min(N, MAX_QUEUE_SIZE), "Mask count mismatch"
+
+    def _score_candidates(self, weights: np.ndarray) -> np.ndarray:
+        """
+        Compute priority scores for all candidates using learned weights.
+
+        This implements the Learned Heuristic approach (Step 2):
+        score_i = w^T @ features_i for each candidate i
+
+        Args:
+            weights: (HEURISTIC_ACTION_DIM,) weight vector from policy
+
+        Returns:
+            scores: (MAX_QUEUE_SIZE,) priority scores for all candidates
+                   - Valid candidates have scores = weights @ features
+                   - Padded positions have scores = 0.0 (masked by _last_mask)
+
+        Requires:
+            - _build_candidates_obs() has been called (sets _last_candidates_obs and _last_mask)
+            - weights.shape == (HEURISTIC_ACTION_DIM,)
+
+        Ensures:
+            - scores.shape == (MAX_QUEUE_SIZE,)
+            - scores[i] = 0.0 for all i where _last_mask[i] == 0.0
+            - All scores are non-negative (weights and features are normalized to [0, 1])
+
+        Example:
+            weights = np.array([0.5, 0.3, 0.1, 0.05, 0.03, 0.02])  # From policy
+            scores = self._score_candidates(weights)  # (1024,) scores
+            # scores[i] = 0.5*remain + 0.3*waiting + 0.1*total + ... for valid candidates
+        """
+        from config import MAX_QUEUE_SIZE, HEURISTIC_ACTION_DIM
+
+        # Precondition checks
+        assert hasattr(self, '_last_candidates_obs'), "Must call _build_candidates_obs() before scoring"
+        assert hasattr(self, '_last_mask'), "Must call _build_candidates_obs() before scoring"
+        assert weights.shape == (HEURISTIC_ACTION_DIM,), \
+            f"Weights shape mismatch: {weights.shape} != ({HEURISTIC_ACTION_DIM},)"
+
+        # Compute scores: matrix multiply (1024, 6) @ (6,) = (1024,)
+        scores = self._last_candidates_obs @ weights  # Element-wise weighted sum
+
+        # Apply mask: set padded positions to 0.0
+        scores = scores * self._last_mask
+
+        # Postcondition checks
+        assert scores.shape == (MAX_QUEUE_SIZE,), \
+            f"Scores shape mismatch: {scores.shape} != ({MAX_QUEUE_SIZE},)"
+        assert np.all(scores >= 0), "Scores should be non-negative"
+        assert np.all(scores[self._last_mask == 0] == 0), "Masked positions should have score 0"
+
+        return scores.astype(np.float32)
+
+    def _get_obs(self) -> Dict[str, np.ndarray]:
+        """
+        Construct and return the current observation as a dictionary.
+
+        Args:
+            None (uses internal state)
+
+        Returns:
+            dict with keys:
+                - 'global': np.ndarray of shape (OBS_G,) - global environment features
+                - 'candidates': np.ndarray of shape (MAX_QUEUE_SIZE, OBS_HOUSE_FEATURES)
+                - 'mask': np.ndarray of shape (MAX_QUEUE_SIZE,) - 1.0 for valid, 0.0 for padding
+
+        Requires:
+            - _build_candidates_obs() has been called (sets cached attributes)
+
+        Ensures:
+            - Returned dict conforms to self.observation_space
+            - global features are normalized to [0, 1] or similar reasonable range
+            - candidates and mask are directly from cache (no duplication)
+
+        Raises:
+            RuntimeError: If _build_candidates_obs() was not called before this
+        """
+        from config import MAX_QUEUE_SIZE, OBS_G, OBS_HOUSE_FEATURES
+
+        # Build global features (existing logic, keep unchanged)
         revealed_ids = list(self.arrival_system.revealed_ids)
 
         if len(revealed_ids) > 0:
@@ -859,43 +1029,25 @@ class BaseEnv(gym.Env):
             major_ratio,
         ], dtype=np.float32)
 
-        # Candidate features (use M_max for fixed size, pad with zeros)
-        candidates = self.pending_candidates if self.pending_candidates else []
+        # Use cached candidates and mask (constructed by _build_candidates_obs)
+        if not hasattr(self, '_last_candidates_obs'):
+            raise RuntimeError("Must call _build_candidates_obs() before _get_obs()")
 
-        candidate_features = np.zeros((self.M_max, 6), dtype=np.float32)
-        for i, house_id in enumerate(candidates):
-            if i >= self.M_max:
-                break
+        obs_dict = {
+            'global': global_features,
+            'candidates': self._last_candidates_obs,
+            'mask': self._last_mask
+        }
 
-            # Get true remaining work
-            true_remain = self._arr_rem[house_id]
+        # Postcondition check
+        assert obs_dict['global'].shape == (OBS_G,), \
+            f"Global shape mismatch: {obs_dict['global'].shape} != ({OBS_G},)"
+        assert obs_dict['candidates'].shape == (MAX_QUEUE_SIZE, OBS_HOUSE_FEATURES), \
+            f"Candidates shape mismatch: {obs_dict['candidates'].shape} != ({MAX_QUEUE_SIZE}, {OBS_HOUSE_FEATURES})"
+        assert obs_dict['mask'].shape == (MAX_QUEUE_SIZE,), \
+            f"Mask shape mismatch: {obs_dict['mask'].shape} != ({MAX_QUEUE_SIZE},)"
 
-            # Add observation noise if enabled
-            if self.obs_noise > 0:
-                # Noisy observation: true_value + N(0, σ * true_value)
-                # This models uncertainty in damage assessment
-                noise = self.rng.normal(0, true_remain * self.obs_noise)
-                observed_remain = max(0, true_remain + noise)
-            else:
-                # Perfect information (legacy mode)
-                observed_remain = true_remain
-
-            candidate_features[i] = [
-                observed_remain,
-                float(self.waiting_time[house_id]),
-                float(self._arr_total[house_id]),
-                float(self._arr_dmg[house_id]),
-                float(self._arr_cmax[house_id]),
-                1.0  # mask: valid
-            ]
-
-        # Flatten and concatenate
-        obs = np.concatenate([
-            global_features,
-            candidate_features.reshape(-1)
-        ])
-
-        return obs
+        return obs_dict
 
     def reset(self, *, seed: Optional[int] = None, options=None):
         """Reset environment to initial state."""
@@ -941,6 +1093,9 @@ class BaseEnv(gym.Env):
         # Prepare the first day so observations reflect valid candidates
         self._begin_day_if_needed()
 
+        # Build initial candidate snapshot for observation
+        self._build_candidates_obs()
+
         obs = self._get_obs()
         info = {
             "day": 0,
@@ -970,15 +1125,21 @@ class RLEnv(BaseEnv):
         """
         Hybrid weighted allocation: Softmax-based but cmax-aware.
 
+        Step 2 (Learned Heuristic):
+        - action is a 6-dimensional weight vector
+        - Scores are computed as: score_i = weights @ features_i
+        - Then use softmax allocation with cmax constraints
+
         Algorithm:
-        1. Use softmax to get "ideal allocation" based on priorities
-        2. Clip by cmax constraints
-        3. Redistribute capacity limited by cmax
-        4. Round to integers preserving total capacity
+        1. Compute scores using learned weights (Step 2)
+        2. Use softmax to get "ideal allocation" based on scores
+        3. Clip by cmax constraints
+        4. Redistribute capacity limited by cmax
+        5. Round to integers preserving total capacity
 
         Args:
             candidates: List of house IDs available for allocation
-            action: Action vector with priority scores
+            action: 6-dimensional weight vector (Step 2)
             K: Total available capacity (contractors)
 
         Returns:
@@ -990,8 +1151,20 @@ class RLEnv(BaseEnv):
         if M == 0 or K <= 0:
             return {}
 
-        # Extract priority scores for actual candidates
-        priorities = action[:M].astype(np.float64)
+        # Step 2: Compute scores using learned weights
+        # action is (6,) weights, _score_candidates returns (1024,) scores
+        all_scores = self._score_candidates(action)  # (1024,) scores for all candidates
+
+        # Extract scores for actual candidates
+        # candidates should match the first M elements of _last_candidate_ids
+        # (since both come from self.pending_candidates)
+        priorities = all_scores[:M].astype(np.float64)
+
+        # Safety check: verify candidates match cached IDs
+        assert M <= len(self._last_candidate_ids), \
+            f"Candidates ({M}) exceed cached candidates ({len(self._last_candidate_ids)})"
+        assert candidates == self._last_candidate_ids[:M], \
+            "Candidates list doesn't match cached candidate IDs"
 
         # Get cmax for each candidate
         cmax_array = np.array([

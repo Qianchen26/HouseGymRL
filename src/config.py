@@ -13,6 +13,8 @@ from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
 
+import numpy as np
+
 # Work duration parameters (per damage level)
 WORK_PARAMS = {
     0: {"median": 30, "sigma": 0.4},
@@ -45,13 +47,39 @@ CAPACITY_RAMP_ENABLED = False
 CANDIDATE_SELECTION = "longest_wait"
 
 # Environment sizing constants
-# PPO version: M is FIXED at 1024 to avoid variable observation dimensions
-M_FIXED = 1024  # Fixed candidate pool size (no longer adaptive)
-MAX_STEPS = 500
+MAX_QUEUE_SIZE = 1024  # Maximum candidate pool size (Step 1: keep 1024, can expand in Step 2/3)
+MAX_STEPS = 500  # Maximum episode length
 OBS_G = 6  # Global features (day, capacity, queue_size, etc.)
-# Per-candidate features: remain, waiting_time, total_work, damage_level, cmax, mask
-OBS_F = 6
-EXPECTED_OBS_DIM = OBS_G + M_FIXED * OBS_F  # 6 + 1024*6 = 6150 dimensions
+OBS_HOUSE_FEATURES = 6  # Features per candidate house: remain, waiting, total_work, damage, cmax, bias
+
+# Backward compatibility aliases
+M_FIXED = MAX_QUEUE_SIZE  # Legacy name for MAX_QUEUE_SIZE
+OBS_F = OBS_HOUSE_FEATURES  # Legacy name for OBS_HOUSE_FEATURES
+EXPECTED_OBS_DIM = OBS_G + M_FIXED * OBS_F  # 6 + 1024*6 = 6150 dimensions (for flat obs)
+
+# Feature normalization scales (consistent between observation and scoring)
+FEATURE_SCALES = np.array([
+    100.0,  # observed_remain (typical range: 0-100+)
+    100.0,  # waiting_time (typical range: 0-100+ days)
+    100.0,  # total_work (typical range: 0-120)
+    2.0,    # damage_level (0, 1, 2 → normalized to 0, 0.5, 1.0)
+    10.0,   # cmax (max daily capacity: 2, 4, 6 → normalized to 0.2, 0.4, 0.6)
+    1.0     # bias term (always 1.0, no scaling)
+], dtype=np.float64)
+
+# Learned heuristic parameters (Step 2)
+HEURISTIC_ACTION_DIM = 6  # Number of weight parameters for learned heuristic
+SCORING_FEATURES = [
+    'observed_remain',
+    'waiting_time',
+    'total_work',
+    'damage_level',
+    'cmax',
+    'bias'
+]
+
+# Allocation parameters (Step 2)
+SOFTMAX_TEMPERATURE = 1.0  # Temperature for softmax allocation (higher = more uniform)
 
 CREW_AVAILABILITY_LEVELS = [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
