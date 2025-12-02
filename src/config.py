@@ -67,8 +67,8 @@ FEATURE_SCALES = np.array([
     1.0     # bias term (always 1.0, no scaling)
 ], dtype=np.float64)
 
-# Learned heuristic parameters (Step 2)
-HEURISTIC_ACTION_DIM = 6  # Number of weight parameters for learned heuristic
+# Learned heuristic parameters (Step 2 - legacy)
+HEURISTIC_ACTION_DIM = 6  # Legacy: Number of weight parameters for learned heuristic
 SCORING_FEATURES = [
     'observed_remain',
     'waiting_time',
@@ -78,8 +78,13 @@ SCORING_FEATURES = [
     'bias'
 ]
 
+# Action space parameters (per-candidate scores)
+ACTION_DIM = MAX_QUEUE_SIZE  # Each candidate gets a score from policy
+ACTION_LOW = -5.0  # Action lower bound (scores for softmax allocation)
+ACTION_HIGH = 5.0  # Action upper bound (scores for softmax allocation)
+
 # Allocation parameters (Step 2)
-SOFTMAX_TEMPERATURE = 1.0  # Temperature for softmax allocation (higher = more uniform)
+SOFTMAX_TEMPERATURE = 0.3  # Lower temperature to further concentrate allocation
 
 CREW_AVAILABILITY_LEVELS = [0.1, 0.3, 0.5, 0.7, 0.9, 1.0]
 
@@ -95,17 +100,34 @@ REGION_CONFIG = {
 }
 
 # Total scenarios: 7 regions × 6 availability levels = 42 scenarios
-CROSS_AVAILABILITY_SCENARIOS = []
-for region_name, config in REGION_CONFIG.items():
-    max_crew = config["num_contractors"]
-    for availability in CREW_AVAILABILITY_LEVELS:
-        CROSS_AVAILABILITY_SCENARIOS.append({
-            "region": region_name,
-            "availability": availability,
-            "actual_crew": int(max_crew * availability),
-            "max_crew": max_crew,
-            "scenario_id": f"{region_name}_av{availability:.1f}"
-        })
+def get_cross_availability_scenarios():
+    """
+    Generate cross-availability scenarios at call time.
+
+    This function generates scenarios dynamically to avoid import-time
+    issues when REGION_CONFIG is modified.
+
+    Returns:
+        List of scenario dictionaries with keys:
+        - region: Region name
+        - availability: Crew availability fraction
+        - actual_crew: Number of contractors at this availability
+        - max_crew: Maximum contractors for the region
+        - scenario_id: Unique identifier string
+    """
+    scenarios = []
+    for region_name, config in REGION_CONFIG.items():
+        max_crew = config["num_contractors"]
+        for availability in CREW_AVAILABILITY_LEVELS:
+            scenarios.append({
+                "region": region_name,
+                "availability": availability,
+                "actual_crew": int(max_crew * availability),
+                "max_crew": max_crew,
+                "scenario_id": f"{region_name}_av{availability:.1f}"
+            })
+    return scenarios
+
 
 # Output directories (without timestamp)
 OUTPUT_BASE_DIR = Path("output")

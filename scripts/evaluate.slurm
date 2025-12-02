@@ -5,22 +5,28 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64gb
+#SBATCH --mem=120gb
 #SBATCH --time=08:00:00
-#SBATCH --partition=hpg-default
+#SBATCH --partition=hpg-turin
+#SBATCH --gres=gpu:l4:1
 #SBATCH --account=vivian.wong
-#SBATCH --qos=vivian.wong-b
+#SBATCH --qos=vivian.wong
 
 # PPO model evaluation on test scenarios
 # Usage: sbatch evaluate.slurm [checkpoint_dir] [output_dir]
 
 module purge
 module load conda
+module load cuda/12.4.1
 conda activate urbanai
 
 # Ensure latest source is used and stdout is unbuffered
 export PYTHONPATH=src
 export PYTHONUNBUFFERED=1
+
+# Verify GPU availability
+echo "GPU Info:"
+nvidia-smi --query-gpu=name,memory.total --format=csv
 
 # Set working directory to ppo/ (not ppo/src/)
 cd /home/yu.qianchen/ondemand/housegymrl/ppo
@@ -30,11 +36,13 @@ CHECKPOINT_DIR=${1:-"runs/ppo_default"}
 OUTPUT_DIR=${2:-"evaluation_results"}
 
 echo "=================================================="
-echo "PPO Evaluation Job"
+echo "PPO Evaluation Job (GPU)"
 echo "=================================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Checkpoint: $CHECKPOINT_DIR"
 echo "Output: $OUTPUT_DIR"
+echo "CPUs: $SLURM_CPUS_PER_TASK"
+echo "GPUs: $SLURM_GPUS_ON_NODE"
 echo "Working directory: $(pwd)"
 echo "Started: $(date)"
 echo "=================================================="

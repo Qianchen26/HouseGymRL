@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from housegymrl import RLEnv, BaselineEnv
 from config import REGION_CONFIG, MAX_STEPS
+from models.attention_policy import AttentionActorCriticPolicy  # Required for PPO.load()
 
 
 def load_model_and_vecnorm(checkpoint_dir: str) -> Tuple[PPO, VecNormalize]:
@@ -114,7 +115,6 @@ def evaluate_on_scenario(
                 num_contractors=num_contr,
                 M_min=1024,
                 M_max=1024,
-                use_batch_arrival=True,
                 stochastic_duration=True,
                 observation_noise=0.15,
                 capacity_noise=0.10,

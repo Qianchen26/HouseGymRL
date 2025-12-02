@@ -44,8 +44,34 @@ housegym_rl/
     ├── baseline.py           # Baseline policies (LJF, SJF, Random)
     ├── config.py             # Configuration constants
     ├── ppo_configs.py        # PPO hyperparameters
-    └── synthetic_scenarios.py # Training data generator
+    ├── synthetic_scenarios.py # Training data generator
+    └── models/
+        └── attention_policy.py # Attention-based policy network
 ```
+
+## Policy Architecture
+
+The policy uses an attention mechanism to process variable-sized candidate pools:
+
+```
+Input:
+  - global_features: (B, 6) system state (day, capacity, queue size, ...)
+  - candidates: (B, 1024, 6) house features (remaining work, waiting time, damage, ...)
+  - mask: (B, 1024) validity mask (1=valid, 0=padding)
+
+Processing:
+  1. Encode candidates: Linear(6 → 64) → house_embeddings
+  2. Encode global as query: Linear(6 → 64) → query
+  3. Single-head attention: query attends to house_embeddings → context
+  4. Score head: Each candidate embedding → MLP → scalar score
+  5. Value head: Pooled embeddings + global → MLP → value
+
+Output:
+  - action: (B, 1024) per-candidate scores for softmax allocation
+  - value: (B, 1) state value estimate
+```
+
+The attention mechanism allows the policy to focus on relevant candidates based on the current system state, enabling better generalization across different scenario sizes.
 
 ## Quick Start
 

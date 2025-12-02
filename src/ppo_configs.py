@@ -38,14 +38,14 @@ class PPOConfig:
         device: Device for computation ('auto', 'cpu', 'cuda').
     """
 
-    learning_rate: float = 2e-5
+    learning_rate: float = 1e-4
     n_steps: int = 2048
     batch_size: int = 512
-    n_epochs: int = 3
+    n_epochs: int = 4
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_range: float = 0.06
-    ent_coef: float = 0.03
+    clip_range: float = 0.10
+    ent_coef: float = 0.01  # Entropy normalized in policy (per-candidate mean), safe to use
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     device: str = 'auto'
@@ -84,7 +84,6 @@ class EnvironmentConfig:
     Attributes:
         M_min: Minimum number of candidates (fixed at 512 for PPO).
         M_max: Maximum number of candidates (fixed at 512 for PPO).
-        use_batch_arrival: Enable batch arrival mechanism (days 0/30/60).
         stochastic_duration: Enable random work progress (±20% noise).
         observation_noise: Observation noise standard deviation as fraction of true value.
             Example: 0.15 → σ = 15% of true remaining work.
@@ -92,16 +91,21 @@ class EnvironmentConfig:
             Example: 0.10 → capacity sampled from [90%, 100%] of base.
         use_capacity_ramp: Enable capacity ramp (typically disabled).
         max_steps: Maximum episode length in days.
+        capacity_ceiling: Maximum daily capacity. If None and use_legacy_capacity_ceiling=False,
+            no ceiling is applied. Default: None.
+        use_legacy_capacity_ceiling: If True, use legacy formula M_max * max(cmax_per_day).
+            This can truncate large contractor pools. Default: False.
     """
 
     M_min: int = 1024
     M_max: int = 1024
-    use_batch_arrival: bool = True
     stochastic_duration: bool = True
     observation_noise: float = 0.15
     capacity_noise: float = 0.10
     use_capacity_ramp: bool = False
     max_steps: int = 500
+    capacity_ceiling: Optional[int] = None
+    use_legacy_capacity_ceiling: bool = False
 
 
 # Predefined configurations
@@ -140,14 +144,12 @@ TRAINING_LONG = TrainingConfig(
 ENV_DEFAULT = EnvironmentConfig()
 
 ENV_DETERMINISTIC = EnvironmentConfig(
-    use_batch_arrival=False,
     stochastic_duration=False,
     observation_noise=0.0,
     capacity_noise=0.0,
 )
 
 ENV_MINIMAL_UNCERTAINTY = EnvironmentConfig(
-    use_batch_arrival=True,
     stochastic_duration=True,
     observation_noise=0.0,
     capacity_noise=0.0,

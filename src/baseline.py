@@ -20,14 +20,13 @@ from pathlib import Path
 # Import our environment classes
 from housegymrl import BaselineEnv, OracleEnv, HousegymRLENV
 import config
-from config import CROSS_AVAILABILITY_SCENARIOS
+from config import get_cross_availability_scenarios
 
 
 def create_baseline_env(
     region_key: str,
     policy: str,
     num_contractors: Optional[int] = None,
-    use_batch_arrival: bool = True,
     use_capacity_ramp: bool = False,
     seed: Optional[int] = None,
 ) -> BaselineEnv:
@@ -38,7 +37,6 @@ def create_baseline_env(
         region_key: Region name from REGION_CONFIG
         policy: "LJF", "SJF", or "Random"
         num_contractors: Number of contractors (if None, use region default)
-        use_batch_arrival: Whether to use batch arrival system
         use_capacity_ramp: Whether to use capacity ramp system
         seed: Random seed
 
@@ -49,7 +47,6 @@ def create_baseline_env(
         region_key=region_key,
         policy=policy,
         num_contractors=num_contractors,
-        use_batch_arrival=use_batch_arrival,
         use_capacity_ramp=use_capacity_ramp,
         seed=seed,
     )
@@ -59,7 +56,6 @@ def create_oracle_env(
     region_key: str,
     policy: str,
     num_contractors: Optional[int] = None,
-    use_batch_arrival: bool = True,
     use_capacity_ramp: bool = False,
     seed: Optional[int] = None,
 ) -> OracleEnv:
@@ -70,7 +66,6 @@ def create_oracle_env(
         region_key: Region name from REGION_CONFIG
         policy: "LJF" or "SJF"
         num_contractors: Number of contractors (if None, use region default)
-        use_batch_arrival: Whether to use batch arrival system
         use_capacity_ramp: Whether to use capacity ramp system
         seed: Random seed
 
@@ -81,7 +76,6 @@ def create_oracle_env(
         region_key=region_key,
         policy=policy,
         num_contractors=num_contractors,
-        use_batch_arrival=use_batch_arrival,
         use_capacity_ramp=use_capacity_ramp,
         seed=seed,
     )
@@ -155,7 +149,6 @@ def compare_baselines(
     region_key: str,
     seed: int = 42,
     max_days: int = 1000,
-    use_batch_arrival: bool = True,
     use_capacity_ramp: bool = True,
 ) -> pd.DataFrame:
     """
@@ -165,7 +158,6 @@ def compare_baselines(
         region_key: Region name from REGION_CONFIG
         seed: Random seed for reproducibility
         max_days: Maximum simulation days
-        use_batch_arrival: Whether to use batch arrival
         use_capacity_ramp: Whether to use capacity ramp
 
     Returns:
@@ -178,7 +170,6 @@ def compare_baselines(
         env = create_baseline_env(
             region_key=region_key,
             policy=policy,
-            use_batch_arrival=use_batch_arrival,
             use_capacity_ramp=use_capacity_ramp,
             seed=seed,
         )
@@ -198,7 +189,6 @@ def compare_baselines(
         env = create_oracle_env(
             region_key=region_key,
             policy=policy,
-            use_batch_arrival=use_batch_arrival,
             use_capacity_ramp=use_capacity_ramp,
             seed=seed,
         )
@@ -249,7 +239,6 @@ def test_baseline_robustness(
             region_key=region_key,
             policy=policy,
             num_contractors=num_contractors,
-            use_batch_arrival=True,
             use_capacity_ramp=True,
             seed=seed,
         )
@@ -334,7 +323,6 @@ if __name__ == "__main__":
     df = compare_baselines(
         region_key="Mataram",
         seed=42,
-        use_batch_arrival=True,
         use_capacity_ramp=True,
     )
 

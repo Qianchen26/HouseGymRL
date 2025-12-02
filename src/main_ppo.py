@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from housegymrl import RLEnv
 from ppo_configs import PPOConfig, TrainingConfig, EnvironmentConfig
 from synthetic_scenarios import generate_scenarios, register_dataframe
+from models.attention_policy import AttentionActorCriticPolicy
 
 
 class ProgressCallback(BaseCallback):
@@ -180,12 +181,13 @@ def create_training_env(
             region_key=selected_region,
             M_min=env_config.M_min,
             M_max=env_config.M_max,
-            use_batch_arrival=env_config.use_batch_arrival,
             stochastic_duration=env_config.stochastic_duration,
             observation_noise=env_config.observation_noise,
             capacity_noise=env_config.capacity_noise,
             use_capacity_ramp=env_config.use_capacity_ramp,
             max_steps=env_config.max_steps,
+            capacity_ceiling=env_config.capacity_ceiling,
+            use_legacy_capacity_ceiling=env_config.use_legacy_capacity_ceiling,
             seed=42 + rank,
         )
         env = Monitor(env)
@@ -267,14 +269,13 @@ def create_ppo_model(
     Example:
         >>> model = create_ppo_model(vec_env, PPO_DEFAULT, "runs/experiment1/tb_logs")
     """
-    # Use MultiInputPolicy for Dict observation space
-    # Network architecture: [256, 256] handles Dict obs from environment
-    policy_kwargs = dict(net_arch=[256, 256])
+    # Use AttentionActorCriticPolicy for attention-based feature extraction
+    # Network architecture is defined inside AttentionActorCriticPolicy (pi=[128], vf=[128])
+    # No need for policy_kwargs here as it's handled by the custom policy
 
     model = PPO(
-        "MultiInputPolicy",  # Changed from MlpPolicy for Dict obs support
+        AttentionActorCriticPolicy,  # Custom attention-based policy
         vec_env,
-        policy_kwargs=policy_kwargs,
         learning_rate=ppo_config.learning_rate,
         n_steps=ppo_config.n_steps,
         batch_size=ppo_config.batch_size,
@@ -408,8 +409,7 @@ def train_ppo(
 
     print(f"Total timesteps: {training_config.total_timesteps:,}")
     print(f"Parallel envs: {training_config.n_envs}")
-    print(f"Uncertainty: batch_arrival={env_config.use_batch_arrival}, "
-          f"stochastic={env_config.stochastic_duration}, "
+    print(f"Uncertainty: stochastic={env_config.stochastic_duration}, "
           f"obs_noise={env_config.observation_noise}, "
           f"cap_noise={env_config.capacity_noise}\n")
 
@@ -541,12 +541,6 @@ def main():
 
     # Uncertainty toggles
     parser.add_argument(
-        "--no-batch-arrival",
-        action="store_true",
-        help="Disable batch arrival (all houses revealed at day 0)",
-    )
-
-    parser.add_argument(
         "--no-stochastic",
         action="store_true",
         help="Disable stochastic work duration",
@@ -589,7 +583,6 @@ def main():
     )
 
     env_config = EnvironmentConfig(
-        use_batch_arrival=not args.no_batch_arrival,
         stochastic_duration=not args.no_stochastic,
         observation_noise=args.obs_noise,
         capacity_noise=args.capacity_noise,

@@ -42,10 +42,15 @@ from config import (
     COMBINED_ARRIVAL_CAPACITY_CONFIG,
     WORK_PARAMS,
     CMAX_BY_LEVEL,
-    DATA_DIR
+    DATA_DIR,
+    ACTION_DIM,
+    ACTION_LOW,
+    ACTION_HIGH,
+    MAX_QUEUE_SIZE,
+    SOFTMAX_TEMPERATURE,
 )
 
-class TrueBatchArrival:
+class BatchArrival:
     """
     Simulates realistic damage assessment timeline.
     Houses are revealed in batches, not all at once.
@@ -121,30 +126,6 @@ class TrueBatchArrival:
 
     def get_revealed_count(self) -> int:
         """Get number of houses revealed so far."""
-        return len(self.revealed_ids)
-
-
-class StaticArrival:
-    """
-    Static arrival: All houses known from day 0.
-    Used as control/baseline for experiments.
-    """
-
-    def __init__(self, tasks_df: pd.DataFrame):
-        self.revealed_ids = set(tasks_df.index.tolist())
-        self.current_day = -1  # Must be -1 so first step_to_day(0) triggers
-
-    def step_to_day(self, day: int) -> List[int]:
-        if day == 0 and self.current_day < 0:
-            self.current_day = day
-            return list(self.revealed_ids)
-        self.current_day = day
-        return []
-
-    def is_complete(self) -> bool:
-        return True
-
-    def get_revealed_count(self) -> int:
         return len(self.revealed_ids)
 
 
@@ -255,13 +236,14 @@ class BaseEnv(gym.Env):
         M_ratio: float = 0.10,
         M_min: int = 1024,
         M_max: int = 1024,
-        use_batch_arrival: bool = True,
         use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
         observation_noise: float = 0.15,
         capacity_noise: float = 0.10,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
+        capacity_ceiling: Optional[int] = None,
+        use_legacy_capacity_ceiling: bool = False,
     ):
         """
         Initialize base environment.
@@ -272,13 +254,14 @@ class BaseEnv(gym.Env):
             M_ratio: Proportion of queue to sample as candidates (default: 0.10 = 10%)
             M_min: Minimum number of candidates (default: 512)
             M_max: Maximum number of candidates (default: 2048)
-            use_batch_arrival: Whether to use batch arrival system
             use_capacity_ramp: Whether to use capacity ramp system
             stochastic_duration: Whether work progress is stochastic (default: True)
             observation_noise: Std dev of observation noise as fraction of true value (default: 0.15)
             capacity_noise: Range of capacity reduction (default: 0.10 = 90%-100% of base)
             seed: Random seed
             max_steps: Maximum simulation days
+            capacity_ceiling: Maximum daily capacity (if None and use_legacy_capacity_ceiling=False, no ceiling)
+            use_legacy_capacity_ceiling: If True, use legacy formula M_max * max(cmax_per_day)
         """
         super().__init__()
 
@@ -305,7 +288,6 @@ class BaseEnv(gym.Env):
         self.max_steps = max_steps
 
         # Set stochasticity parameters
-        self.use_batch_arrival = use_batch_arrival
         self.stochastic_duration = stochastic_duration
         self.observation_noise = observation_noise
         self.obs_noise = observation_noise
@@ -314,25 +296,38 @@ class BaseEnv(gym.Env):
         # Load scenario data
         self.tasks_df = self._load_scenario(region_key)
 
+        # Verify index is 0-based continuous (required for array indexing)
+        expected_ids = set(range(len(self.tasks_df)))
+        actual_ids = set(self.tasks_df.index)
+        assert expected_ids == actual_ids, \
+            f"house_id not 0-based continuous: expected 0..{len(self.tasks_df)-1}, got {sorted(actual_ids)[:5]}..."
+
         # Initialize work arrays
         self._arr_total = self.tasks_df['man_days_total'].values.astype(np.float32)
         self._arr_rem = self.tasks_df['man_days_remaining'].values.copy().astype(np.float32)
         self._arr_dmg = self.tasks_df['damage_level'].values.astype(np.int32)
         self._arr_cmax = self.tasks_df['cmax_per_day'].values.astype(np.float32)
-        self.capacity_ceiling = int(self.M_max * float(self._arr_cmax.max()))
+
+        # Set capacity ceiling based on parameters
+        if use_legacy_capacity_ceiling:
+            # Legacy behavior: M_max * max(cmax_per_day) - truncates large contractor pools
+            self.capacity_ceiling = int(self.M_max * float(self._arr_cmax.max()))
+        elif capacity_ceiling is not None:
+            # Explicit ceiling provided
+            self.capacity_ceiling = capacity_ceiling
+        else:
+            # No ceiling - allows full contractor capacity
+            self.capacity_ceiling = None
 
         # Total work across all houses (fixed denominator for reward scaling)
         self._total_work_all = float(sum(self._arr_total))
 
         # Initialize systems
-        if use_batch_arrival:
-            self.arrival_system = TrueBatchArrival(
-                self.tasks_df,
-                COMBINED_ARRIVAL_CAPACITY_CONFIG["batch_arrival"],
-                seed if seed is not None else 42
-            )
-        else:
-            self.arrival_system = StaticArrival(self.tasks_df)
+        self.arrival_system = BatchArrival(
+            self.tasks_df,
+            COMBINED_ARRIVAL_CAPACITY_CONFIG["batch_arrival"],
+            seed if seed is not None else 42
+        )
 
         self.use_capacity_ramp = bool(use_capacity_ramp and config.CAPACITY_RAMP_ENABLED)
         if use_capacity_ramp and not self.use_capacity_ramp:
@@ -385,7 +380,13 @@ class BaseEnv(gym.Env):
         # Try to load from pickle if exists
         pkl_path = DATA_DIR / f"{region_key.lower().replace(' ', '_')}_tasks.pkl"
         if pkl_path.exists():
-            return pd.read_pickle(pkl_path)
+            df = pd.read_pickle(pkl_path)
+            # Ensure 0-based continuous index for array indexing
+            if 'original_house_id' not in df.columns:
+                df['original_house_id'] = df.index
+            df = df.reset_index(drop=True)
+            df.index.name = 'house_id'
+            return df
 
         # Otherwise generate synthetic data
         config = self.region_config
@@ -466,12 +467,12 @@ class BaseEnv(gym.Env):
             )
         })
 
-        # Action: learned heuristic weights (Step 2)
-        # 6-dimensional weight vector for scoring candidates
+        # Action: per-candidate scores (direct allocation)
+        # Each candidate gets a score from the policy, used for softmax allocation
         self.action_space = spaces.Box(
-            low=0.0,
-            high=1.0,
-            shape=(HEURISTIC_ACTION_DIM,),  # 6 weights
+            low=ACTION_LOW,
+            high=ACTION_HIGH,
+            shape=(ACTION_DIM,),  # 1024 scores (one per candidate slot)
             dtype=np.float32
         )
 
@@ -481,7 +482,7 @@ class BaseEnv(gym.Env):
         if self.capacity_noise > 0 and base_capacity > 0:
             noise_factor = self.rng.uniform(1.0 - self.capacity_noise, 1.0)
             base_capacity = int(base_capacity * noise_factor)
-        if self.capacity_ceiling:
+        if self.capacity_ceiling is not None:
             base_capacity = min(base_capacity, self.capacity_ceiling)
         return max(0, base_capacity)
 
@@ -1060,15 +1061,12 @@ class BaseEnv(gym.Env):
         self.last_arr_rem = self._arr_rem.copy()  # Track previous step's remaining work
 
         # Reset systems
-        if isinstance(self.arrival_system, TrueBatchArrival):
-            self.arrival_system = TrueBatchArrival(
+        if isinstance(self.arrival_system, BatchArrival):
+            self.arrival_system = BatchArrival(
                 self.tasks_df,
                 COMBINED_ARRIVAL_CAPACITY_CONFIG["batch_arrival"],
                 self.seed if self.seed is not None else 42
             )
-        elif isinstance(self.arrival_system, StaticArrival):
-            # Recreate StaticArrival to ensure queue is populated on each episode
-            self.arrival_system = StaticArrival(self.tasks_df)
 
         self.waiting_queue = WaitingQueue()
         self.day = 0
@@ -1123,23 +1121,19 @@ class RLEnv(BaseEnv):
         K: int
     ) -> Dict[int, int]:
         """
-        Hybrid weighted allocation: Softmax-based but cmax-aware.
-
-        Step 2 (Learned Heuristic):
-        - action is a 6-dimensional weight vector
-        - Scores are computed as: score_i = weights @ features_i
-        - Then use softmax allocation with cmax constraints
+        Direct score-based allocation: Policy outputs per-candidate scores.
 
         Algorithm:
-        1. Compute scores using learned weights (Step 2)
-        2. Use softmax to get "ideal allocation" based on scores
-        3. Clip by cmax constraints
-        4. Redistribute capacity limited by cmax
-        5. Round to integers preserving total capacity
+        1. Use action directly as per-candidate scores (no learned weights)
+        2. Mask invalid candidates with -inf
+        3. Use softmax (with temperature) to get allocation distribution
+        4. Clip by cmax and remaining work constraints
+        5. Redistribute leftover capacity
+        6. Round to integers preserving total capacity
 
         Args:
             candidates: List of house IDs available for allocation
-            action: 6-dimensional weight vector (Step 2)
+            action: Per-candidate scores from policy. Shape: (ACTION_DIM,)
             K: Total available capacity (contractors)
 
         Returns:
@@ -1151,20 +1145,20 @@ class RLEnv(BaseEnv):
         if M == 0 or K <= 0:
             return {}
 
-        # Step 2: Compute scores using learned weights
-        # action is (6,) weights, _score_candidates returns (1024,) scores
-        all_scores = self._score_candidates(action)  # (1024,) scores for all candidates
-
-        # Extract scores for actual candidates
-        # candidates should match the first M elements of _last_candidate_ids
-        # (since both come from self.pending_candidates)
-        priorities = all_scores[:M].astype(np.float64)
-
         # Safety check: verify candidates match cached IDs
         assert M <= len(self._last_candidate_ids), \
             f"Candidates ({M}) exceed cached candidates ({len(self._last_candidate_ids)})"
         assert candidates == self._last_candidate_ids[:M], \
             "Candidates list doesn't match cached candidate IDs"
+
+        # Direct scores from policy action (first M elements correspond to candidates)
+        scores = action[:M].astype(np.float64).copy()
+
+        # Mask invalid positions (shouldn't happen if M <= actual candidates, but safety)
+        # The policy already masked invalid positions with -1e9, but we ensure here
+
+        # Apply temperature scaling for softmax
+        priorities = scores / SOFTMAX_TEMPERATURE
 
         # Get cmax for each candidate
         cmax_array = np.array([
@@ -1178,29 +1172,26 @@ class RLEnv(BaseEnv):
             for i in range(M)
         ], dtype=np.float64)
 
-        # Step 1: Softmax allocation (ideal distribution)
+        # Softmax allocation (ideal distribution)
         # Subtract max for numerical stability
         exp_p = np.exp(priorities - np.max(priorities))
         probs = exp_p / (exp_p.sum() + 1e-10)  # Add epsilon to prevent division by zero
         ideal_allocation = probs * K
 
-        # Step 2: Clip by cmax AND remaining_work constraints
-        # This prevents over-allocation to nearly-complete houses
+        # Clip by cmax AND remaining_work constraints
         allocation = np.minimum(ideal_allocation, np.minimum(cmax_array, remaining_work_array))
 
-        # Step 3: Redistribute leftover capacity
+        # Redistribute leftover capacity
         used = allocation.sum()
         leftover = K - used
 
         if leftover > 1e-6:  # If there's significant leftover capacity
             # Find houses that can accept more contractors
-            # Must consider BOTH cmax constraint AND remaining work
             can_take_more = np.minimum(cmax_array, remaining_work_array) - allocation
             can_take_more = np.maximum(can_take_more, 0)
 
             if can_take_more.sum() > 1e-6:
                 # Redistribute proportionally based on original priorities
-                # but only to houses that can accept more
                 eligible_mask = can_take_more > 1e-6
                 eligible_probs = probs * eligible_mask
 
@@ -1210,7 +1201,7 @@ class RLEnv(BaseEnv):
                     extra_allocation = np.minimum(extra_allocation, can_take_more)
                     allocation += extra_allocation
 
-        # Step 4: Convert to integers while preserving total capacity
+        # Convert to integers while preserving total capacity
         int_allocation = np.floor(allocation).astype(int)
         remaining = int(K - int_allocation.sum())
 
@@ -1225,18 +1216,17 @@ class RLEnv(BaseEnv):
             # Give to houses with largest fractional parts
             if np.any(can_accept):
                 top_indices = np.argsort(-fractional)[:remaining]
-                # Double-check they can actually accept
                 for idx in top_indices:
                     if int_allocation[idx] < cmax_array[idx]:
                         int_allocation[idx] += 1
 
-        # Step 5: Build result dictionary (only include houses with allocation > 0)
+        # Build result dictionary (only include houses with allocation > 0)
         result = {}
         for i in range(M):
             if int_allocation[i] > 0:
                 result[candidates[i]] = int(int_allocation[i])
 
-        # Validation assertions (can be removed in production)
+        # Validation assertions
         total_allocated = sum(result.values())
         assert total_allocated <= K, f"Over-allocated: {total_allocated} > {K}"
         for house_id, num in result.items():
@@ -1260,13 +1250,14 @@ class BaselineEnv(BaseEnv):
         M_ratio: float = 0.10,
         M_min: int = 1024,
         M_max: int = 1024,
-        use_batch_arrival: bool = True,
         use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
         observation_noise: float = 0.15,
         capacity_noise: float = 0.10,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
+        capacity_ceiling: Optional[int] = None,
+        use_legacy_capacity_ceiling: bool = False,
     ):
         """
         Initialize baseline environment.
@@ -1281,13 +1272,14 @@ class BaselineEnv(BaseEnv):
             M_ratio=M_ratio,
             M_min=M_min,
             M_max=M_max,
-            use_batch_arrival=use_batch_arrival,
             use_capacity_ramp=use_capacity_ramp,
             stochastic_duration=stochastic_duration,
             observation_noise=observation_noise,
             capacity_noise=capacity_noise,
             seed=seed,
             max_steps=max_steps,
+            capacity_ceiling=capacity_ceiling,
+            use_legacy_capacity_ceiling=use_legacy_capacity_ceiling,
         )
 
         assert policy in ["LJF", "SJF", "Random"], \
@@ -1360,13 +1352,14 @@ class OracleEnv(BaseEnv):
         M_ratio: float = 0.10,
         M_min: int = 1024,
         M_max: int = 1024,
-        use_batch_arrival: bool = True,
         use_capacity_ramp: bool = False,
         stochastic_duration: bool = True,
         observation_noise: float = 0.15,
         capacity_noise: float = 0.10,
         seed: Optional[int] = None,
         max_steps: int = MAX_STEPS,
+        capacity_ceiling: Optional[int] = None,
+        use_legacy_capacity_ceiling: bool = False,
     ):
         """
         Initialize oracle environment.
@@ -1381,18 +1374,160 @@ class OracleEnv(BaseEnv):
             M_ratio=M_ratio,
             M_min=M_min,
             M_max=M_max,
-            use_batch_arrival=use_batch_arrival,
             use_capacity_ramp=use_capacity_ramp,
             stochastic_duration=stochastic_duration,
             observation_noise=observation_noise,
             capacity_noise=capacity_noise,
             seed=seed,
             max_steps=max_steps,
+            capacity_ceiling=capacity_ceiling,
+            use_legacy_capacity_ceiling=use_legacy_capacity_ceiling,
         )
 
         assert policy in ["LJF", "SJF"], \
             f"Oracle policy must be LJF or SJF, got {policy}"
         self.policy = policy
+
+    def _define_spaces(self):
+        """
+        Override to use total houses instead of fixed MAX_QUEUE_SIZE.
+
+        Oracle sees the entire queue, so observation space must accommodate
+        all houses, not just the M_max candidate limit.
+        """
+        from config import OBS_G, OBS_HOUSE_FEATURES, HEURISTIC_ACTION_DIM
+
+        total_houses = len(self.tasks_df)
+
+        self.observation_space = spaces.Dict({
+            'global': spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(OBS_G,),  # 6 global features
+                dtype=np.float32
+            ),
+            'candidates': spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(total_houses, OBS_HOUSE_FEATURES),  # (N, 6) where N = total houses
+                dtype=np.float32
+            ),
+            'mask': spaces.Box(
+                low=0,
+                high=1,
+                shape=(total_houses,),  # (N,)
+                dtype=np.float32
+            )
+        })
+
+        # Action space: same as BaseEnv (learned heuristic weights)
+        self.action_space = spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(HEURISTIC_ACTION_DIM,),  # 6 weights
+            dtype=np.float32
+        )
+
+    def _build_candidates_obs(self) -> None:
+        """
+        Override to build observation for all houses in queue (no M limit).
+
+        Uses total houses instead of MAX_QUEUE_SIZE for observation arrays.
+        Caches results in existing field names: _last_candidates_obs, _last_mask, _last_candidate_ids.
+        """
+        from config import OBS_HOUSE_FEATURES, FEATURE_SCALES
+
+        total_houses = len(self.tasks_df)
+
+        # Get candidate house IDs (Oracle sees entire queue)
+        candidate_ids = self.pending_candidates if self.pending_candidates else []
+
+        # Initialize arrays sized to total houses (not MAX_QUEUE_SIZE)
+        candidates = np.zeros((total_houses, OBS_HOUSE_FEATURES), dtype=np.float32)
+        mask = np.zeros(total_houses, dtype=np.float32)
+
+        # Fill features for actual candidates
+        for i, house_id in enumerate(candidate_ids):
+            if i >= total_houses:
+                break
+
+            # Extract raw features (same logic as BaseEnv)
+            true_remain = self._arr_rem[house_id]
+            if self.obs_noise > 0:
+                noise = self.rng.normal(0, true_remain * self.obs_noise)
+                observed_remain = max(0, true_remain + noise)
+            else:
+                observed_remain = true_remain
+
+            waiting_time = float(self.waiting_time[house_id])
+            total_work = float(self._arr_total[house_id])
+            damage_level = float(self._arr_dmg[house_id])
+            cmax = float(self._arr_cmax[house_id])
+
+            # Normalize using FEATURE_SCALES from config
+            candidates[i] = [
+                observed_remain / FEATURE_SCALES[0],
+                waiting_time / FEATURE_SCALES[1],
+                total_work / FEATURE_SCALES[2],
+                damage_level / FEATURE_SCALES[3],
+                cmax / FEATURE_SCALES[4],
+                1.0  # Bias term
+            ]
+            mask[i] = 1.0
+
+        # Cache using existing field names
+        self._last_candidates_obs = candidates
+        self._last_mask = mask
+        self._last_candidate_ids = candidate_ids
+
+    def _get_obs(self) -> Dict[str, np.ndarray]:
+        """
+        Override to return observation with dynamic shape (total_houses instead of MAX_QUEUE_SIZE).
+        """
+        from config import OBS_G, OBS_HOUSE_FEATURES
+
+        total_houses = len(self.tasks_df)
+
+        # Build global features (same logic as BaseEnv)
+        revealed_ids = list(self.arrival_system.revealed_ids)
+
+        if len(revealed_ids) > 0:
+            revealed_total = self._arr_total[revealed_ids].sum()
+            revealed_remaining = self._arr_rem[revealed_ids].sum()
+            completion_rate = 1.0 - (revealed_remaining / revealed_total) if revealed_total > 0 else 0.0
+        else:
+            revealed_total = 0.0
+            revealed_remaining = 0.0
+            completion_rate = 0.0
+
+        global_features = np.array([
+            float(self.day) / self.max_steps,
+            float(self.current_day_capacity) / max(self.num_contractors or 1, 1),
+            float(len(self.pending_candidates)) / total_houses,
+            float(self.waiting_queue.size()) / total_houses,
+            completion_rate,
+            float(revealed_remaining) / max(float(self._total_work_all), 1.0),
+        ], dtype=np.float32)
+
+        # Verify cache exists
+        if not hasattr(self, '_last_candidates_obs') or self._last_candidates_obs is None:
+            raise RuntimeError("Must call _build_candidates_obs() before _get_obs()")
+
+        obs_dict = {
+            'global': global_features,
+            'candidates': self._last_candidates_obs,
+            'mask': self._last_mask
+        }
+
+        # Postcondition check with dynamic shape
+        assert obs_dict['global'].shape == (OBS_G,), \
+            f"Global shape mismatch: {obs_dict['global'].shape} != ({OBS_G},)"
+        assert obs_dict['candidates'].shape == (total_houses, OBS_HOUSE_FEATURES), \
+            f"Candidates shape mismatch: {obs_dict['candidates'].shape} != ({total_houses}, {OBS_HOUSE_FEATURES})"
+        assert obs_dict['mask'].shape == (total_houses,), \
+            f"Mask shape mismatch: {obs_dict['mask'].shape} != ({total_houses},)"
+
+        return obs_dict
 
     def _select_candidates(self, queue_ids: List[int]) -> List[int]:
         """Oracle sees entire queue (no M limit)."""

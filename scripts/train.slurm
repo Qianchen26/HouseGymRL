@@ -4,22 +4,28 @@
 #SBATCH --error=/home/yu.qianchen/ondemand/housegymrl/ppo/logs/train_%j.err
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=64
-#SBATCH --mem=192gb
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=120gb
 #SBATCH --time=24:00:00
-#SBATCH --partition=hpg-default
+#SBATCH --partition=hpg-turin
+#SBATCH --gres=gpu:l4:1
 #SBATCH --account=vivian.wong
-#SBATCH --qos=vivian.wong-b
+#SBATCH --qos=vivian.wong
 
 # Single PPO training experiment on HiPerGator
 # Usage: sbatch train.slurm [experiment_name] [timesteps] [region]
 
 module purge
 module load conda
+module load cuda/12.4.1
 conda activate urbanai
 
 # Enable Python unbuffered output (important for real-time logging)
 export PYTHONUNBUFFERED=1
+
+# Verify GPU availability
+echo "GPU Info:"
+nvidia-smi --query-gpu=name,memory.total --format=csv
 
 # Set working directory to ppo/ (not ppo/src/)
 cd /home/yu.qianchen/ondemand/housegymrl/ppo
@@ -30,13 +36,14 @@ TIMESTEPS=${2:-1000000}
 USE_SYNTHETIC=${3:-"true"}  # Default to synthetic training for robustness
 
 echo "=================================================="
-echo "PPO Training Job"
+echo "PPO Training Job (GPU)"
 echo "=================================================="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Experiment: $EXPERIMENT_NAME"
 echo "Timesteps: $TIMESTEPS"
 echo "Use Synthetic: $USE_SYNTHETIC"
 echo "CPUs: $SLURM_CPUS_PER_TASK"
+echo "GPUs: $SLURM_GPUS_ON_NODE"
 echo "Working directory: $(pwd)"
 echo "Started: $(date)"
 echo "=================================================="

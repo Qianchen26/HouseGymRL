@@ -30,7 +30,7 @@ ENV/
 
 # Training Artifacts (Large files - should not be in git)
 runs/
-models/
+/models/
 artifacts/
 output/
 results/*.csv
