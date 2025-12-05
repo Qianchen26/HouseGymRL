@@ -35,6 +35,9 @@ class PPOConfig:
             Range: [0.1, 1.0]. Controls importance of value function training.
         max_grad_norm: Maximum gradient norm for clipping.
             Range: [0.3, 1.0]. Prevents gradient explosion.
+        target_kl: Target KL divergence for early stopping.
+            Range: [0.01, 0.05]. If KL exceeds this, stop current epoch.
+            Set to None to disable.
         device: Device for computation ('auto', 'cpu', 'cuda').
     """
 
@@ -48,6 +51,7 @@ class PPOConfig:
     ent_coef: float = 0.01  # Entropy normalized in policy (per-candidate mean), safe to use
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
+    target_kl: Optional[float] = None  # KL early stopping threshold
     device: str = 'auto'
 
 
@@ -108,49 +112,30 @@ class EnvironmentConfig:
     use_legacy_capacity_ceiling: bool = False
 
 
-# Predefined configurations
-
-PPO_DEFAULT = PPOConfig()
-
-PPO_FAST = PPOConfig(
-    learning_rate=5e-4,
-    n_steps=1024,
-    batch_size=128,
-    n_epochs=5,
+# Predefined configuration
+PPO_DEFAULT = PPOConfig(
+    learning_rate=5e-5,    # Will use linear decay in main_ppo.py
+    n_steps=2048,          # Rollout length before each update
+    batch_size=512,        # Mini-batch size for SGD
+    n_epochs=4,            # Optimization passes per rollout
+    clip_range=0.08,       # V1 config: best final reward (630)
+    ent_coef=0.02,         # Entropy bonus for exploration
 )
 
-PPO_STABLE = PPOConfig(
-    learning_rate=1e-4,
-    n_steps=4096,
-    batch_size=512,
-    n_epochs=15,
-    clip_range=0.1,
+TRAINING_DEFAULT = TrainingConfig(
+    total_timesteps=1_000_000,
+    n_envs=16,
+    save_freq=50_000,
+    eval_freq=100_000,
+    log_interval=1,
 )
 
-TRAINING_DEFAULT = TrainingConfig()
-
-TRAINING_QUICK = TrainingConfig(
-    total_timesteps=100_000,
-    n_envs=8,
-    save_freq=25_000,
-)
-
-TRAINING_LONG = TrainingConfig(
-    total_timesteps=2_000_000,
-    n_envs=32,
-    save_freq=100_000,
-)
-
-ENV_DEFAULT = EnvironmentConfig()
-
-ENV_DETERMINISTIC = EnvironmentConfig(
-    stochastic_duration=False,
-    observation_noise=0.0,
-    capacity_noise=0.0,
-)
-
-ENV_MINIMAL_UNCERTAINTY = EnvironmentConfig(
+ENV_DEFAULT = EnvironmentConfig(
+    M_min=1024,
+    M_max=1024,
     stochastic_duration=True,
-    observation_noise=0.0,
-    capacity_noise=0.0,
+    observation_noise=0.15,
+    capacity_noise=0.10,
+    use_capacity_ramp=False,
+    max_steps=500,
 )

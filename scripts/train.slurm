@@ -30,6 +30,9 @@ nvidia-smi --query-gpu=name,memory.total --format=csv
 # Set working directory to ppo/ (not ppo/src/)
 cd /home/yu.qianchen/ondemand/housegymrl/ppo
 
+# IMPORTANT: Set PYTHONPATH to ensure using current source code
+export PYTHONPATH=$(pwd)/src:$PYTHONPATH
+
 # Parse arguments
 EXPERIMENT_NAME=${1:-"ppo_default"}
 TIMESTEPS=${2:-1000000}

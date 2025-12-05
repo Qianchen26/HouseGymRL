@@ -258,6 +258,7 @@ class AttentionFeaturesExtractor(BaseFeaturesExtractor):
         self._last_mask: Optional[torch.Tensor] = None
         self._last_attention_weights: Optional[torch.Tensor] = None
         self._last_global_features: Optional[torch.Tensor] = None
+        self._last_attention_context: Optional[torch.Tensor] = None
 
     def forward(self, observations: Dict[str, torch.Tensor]) -> torch.Tensor:
         """
@@ -297,6 +298,7 @@ class AttentionFeaturesExtractor(BaseFeaturesExtractor):
         self._last_mask = mask
         self._last_attention_weights = attention_weights.detach()
         self._last_global_features = global_features
+        self._last_attention_context = attention_context
 
         # Concatenate global features and attention context
         features = torch.cat([global_features, attention_context], dim=-1)
@@ -323,40 +325,36 @@ class AttentionFeaturesExtractor(BaseFeaturesExtractor):
         """Get cached global features from last forward pass. Shape: (B, global_dim)"""
         return self._last_global_features
 
+    def get_last_attention_context(self) -> Optional[torch.Tensor]:
+        """Get cached attention context from last forward pass. Shape: (B, embed_dim)"""
+        return self._last_attention_context
+
 
 class ScoreHead(nn.Module):
     """
     MLP head that outputs a scalar score for each candidate embedding.
 
     Applies the same MLP to each candidate independently to produce per-candidate
-    scores for allocation. Initialized with small weights for stable training.
+    scores for allocation. Uses default PyTorch initialization (Kaiming) for
+    meaningful gradient signal.
     """
 
-    def __init__(self, embed_dim: int = ATTENTION_EMBED_DIM, hidden_dim: int = 32) -> None:
+    def __init__(self, input_dim: int = ATTENTION_EMBED_DIM * 2, hidden_dim: int = 64) -> None:
         """
-        Initialize the score head with small weights.
+        Initialize the score head.
 
         Args:
-            embed_dim: Dimension of input embeddings (default 64).
-            hidden_dim: Hidden layer dimension (default 32).
+            input_dim: Dimension of input (embed_dim * 2 for concatenated context).
+            hidden_dim: Hidden layer dimension (default 64).
         """
         super().__init__()
 
         self.mlp = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
+            nn.Linear(input_dim, hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, 1),
         )
-
-        # Initialize with small weights for stable initial policy (near-uniform allocation)
-        self._init_weights()
-
-    def _init_weights(self) -> None:
-        """Initialize weights to produce near-zero initial outputs."""
-        for module in self.mlp.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=1e-3)
-                nn.init.zeros_(module.bias)
+        # Use default PyTorch initialization (Kaiming) for meaningful gradients
 
     def forward(self, embeddings: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -428,7 +426,8 @@ class AttentionActorCriticPolicy(ActorCriticPolicy):
         self.global_dim = observation_space['global'].shape[0]
 
         # Build custom score head for policy (per-candidate scores)
-        self.score_head = ScoreHead(embed_dim=self.embed_dim)
+        # Input: house_embeddings (embed_dim) + attention_context (embed_dim) = embed_dim * 2
+        self.score_head = ScoreHead(input_dim=self.embed_dim * 2)
 
         # Learnable log_std for action distribution (one per action dimension)
         # Initialize to 0.0 (std=1.0) for sufficient initial exploration
@@ -479,10 +478,16 @@ class AttentionActorCriticPolicy(ActorCriticPolicy):
         house_embeddings = self.features_extractor.get_last_house_embeddings()
         mask = self.features_extractor.get_last_mask()
         global_features = self.features_extractor.get_last_global_features()
+        attention_context = self.features_extractor.get_last_attention_context()
+
+        # Concatenate attention_context with each candidate embedding
+        # attention_context: (B, embed_dim) -> (B, MAX_Q, embed_dim)
+        ctx_expanded = attention_context.unsqueeze(1).expand(-1, self.max_queue_size, -1)
+        combined = torch.cat([house_embeddings, ctx_expanded], dim=-1)  # (B, MAX_Q, embed_dim*2)
 
         # Compute per-candidate scores as action mean (B, MAX_Q)
         # ScoreHead applies mask internally (invalid positions get -1e9)
-        action_mean = self.score_head(house_embeddings, mask)
+        action_mean = self.score_head(combined, mask)
 
         # Compute value using pooled embeddings
         values = self._compute_value(house_embeddings, mask, global_features)
@@ -563,12 +568,17 @@ class AttentionActorCriticPolicy(ActorCriticPolicy):
         house_embeddings = self.features_extractor.get_last_house_embeddings()
         mask = self.features_extractor.get_last_mask()
         global_features = self.features_extractor.get_last_global_features()
+        attention_context = self.features_extractor.get_last_attention_context()
 
         # Compute value
         values = self._compute_value(house_embeddings, mask, global_features)
 
+        # Concatenate attention_context with each candidate embedding
+        ctx_expanded = attention_context.unsqueeze(1).expand(-1, self.max_queue_size, -1)
+        combined = torch.cat([house_embeddings, ctx_expanded], dim=-1)  # (B, MAX_Q, embed_dim*2)
+
         # Compute action mean from ScoreHead
-        action_mean = self.score_head(house_embeddings, mask)
+        action_mean = self.score_head(combined, mask)
 
         # Build Gaussian distribution
         std = torch.exp(self.log_std).expand_as(action_mean)

@@ -32,7 +32,7 @@ from stable_baselines3.common.monitor import Monitor
 sys.path.insert(0, str(Path(__file__).parent))
 
 from housegymrl import RLEnv
-from ppo_configs import PPOConfig, TrainingConfig, EnvironmentConfig
+from ppo_configs import PPOConfig, TrainingConfig, EnvironmentConfig, PPO_DEFAULT
 from synthetic_scenarios import generate_scenarios, register_dataframe
 from models.attention_policy import AttentionActorCriticPolicy
 
@@ -248,11 +248,27 @@ def setup_vec_env(
     return vec_env
 
 
+def linear_schedule(initial_value: float):
+    """
+    Linear learning rate schedule: decays from initial_value to 0.
+
+    Args:
+        initial_value: Initial learning rate.
+
+    Returns:
+        Callable that takes progress_remaining (1.0 -> 0.0) and returns current LR.
+    """
+    def func(progress_remaining: float) -> float:
+        return progress_remaining * initial_value
+    return func
+
+
 def create_ppo_model(
     vec_env: VecNormalize,
     ppo_config: PPOConfig,
     tensorboard_log: str,
-    verbose: int = 1
+    verbose: int = 1,
+    use_lr_decay: bool = True
 ) -> PPO:
     """
     Create PPO model with specified hyperparameters.
@@ -262,6 +278,7 @@ def create_ppo_model(
         ppo_config: PPO hyperparameter configuration dataclass.
         tensorboard_log: Path to TensorBoard log directory (string).
         verbose: Verbosity level (0: silent, 1: info, 2: debug).
+        use_lr_decay: If True, use linear LR decay from initial to 0.
 
     Returns:
         PPO model instance ready for training.
@@ -273,10 +290,13 @@ def create_ppo_model(
     # Network architecture is defined inside AttentionActorCriticPolicy (pi=[128], vf=[128])
     # No need for policy_kwargs here as it's handled by the custom policy
 
+    # Learning rate: linear decay or constant
+    lr = linear_schedule(ppo_config.learning_rate) if use_lr_decay else ppo_config.learning_rate
+
     model = PPO(
         AttentionActorCriticPolicy,  # Custom attention-based policy
         vec_env,
-        learning_rate=ppo_config.learning_rate,
+        learning_rate=lr,
         n_steps=ppo_config.n_steps,
         batch_size=ppo_config.batch_size,
         n_epochs=ppo_config.n_epochs,
@@ -286,6 +306,7 @@ def create_ppo_model(
         ent_coef=ppo_config.ent_coef,
         vf_coef=ppo_config.vf_coef,
         max_grad_norm=ppo_config.max_grad_norm,
+        target_kl=ppo_config.target_kl,  # KL early stopping
         device=ppo_config.device,
         verbose=verbose,
         tensorboard_log=tensorboard_log,
@@ -431,6 +452,20 @@ def train_ppo(
         synthetic_seed=synthetic_seed,
     )
 
+    # Create evaluation environment (single env, no subprocess for stability)
+    print("Creating evaluation environment...")
+    eval_vec_env = setup_vec_env(
+        n_envs=1,
+        env_config=env_config,
+        region_key=region_key,
+        use_subprocess=False,  # DummyVecEnv for eval
+        synthetic_region_keys=synthetic_region_keys,
+        synthetic_seed=synthetic_seed,
+    )
+    # Eval env should not update normalization stats
+    eval_vec_env.training = False
+    eval_vec_env.norm_reward = False
+
     # Create or load model
     if resume_from:
         print(f"Resuming from checkpoint: {resume_from}")
@@ -456,7 +491,7 @@ def train_ppo(
         experiment_name=experiment_name,
         save_dir=str(save_dir),
         training_config=training_config,
-        eval_env=None,  # Can add eval env later if needed
+        eval_env=eval_vec_env,  # Enable EvalCallback to save best model
     )
 
     # Train
@@ -490,9 +525,11 @@ def train_ppo(
     print(f"Model saved to: {save_dir / 'model.zip'}")
     print(f"VecNormalize saved to: {save_dir / 'vecnormalize.pkl'}")
     print(f"TensorBoard logs: {tb_log_dir}")
+    print(f"Best model saved to: {save_dir / 'eval' / 'best_model.zip'}")
     print(f"{'='*80}\n")
 
     vec_env.close()
+    eval_vec_env.close()
 
 
 def main():
@@ -592,7 +629,7 @@ def main():
     train_ppo(
         experiment_name=args.experiment_name,
         region_key=args.region,
-        ppo_config=PPOConfig(),
+        ppo_config=PPO_DEFAULT,
         training_config=training_config,
         env_config=env_config,
         resume_from=args.resume_from,
